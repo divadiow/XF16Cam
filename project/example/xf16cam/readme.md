@@ -1,7 +1,10 @@
-# XF16Cam RTSP camera
+# XF16Cam developer notes
 
-This isolated example turns the XF16/XR872ET camera JPEG path into a
-single-client RTSP stream without PSRAM or an SD card.
+[Project overview](../../../README.md) · [Hardware guide](../../../docs/hardware.md) ·
+[Flashing guide](../../../docs/flashing.md)
+
+This standalone application turns the XF16/XR872ET-family camera JPEG path into
+browser MJPEG or a single-client RTSP stream without PSRAM.
 
 - First boot starts the open setup AP `XF16CAM` at `192.168.4.1`.
 - The setup AP is intentionally unauthenticated; anyone in radio range can
@@ -77,7 +80,8 @@ single-client RTSP stream without PSRAM or an SD card.
 - SP0A20 (`0x2b`): factory HQT6 VGA table, hardware validated on XF16; QVGA is
   the default and native VGA is selectable.
 - SP0A39 (ID `0x0a:0x39`): exact XF16 factory 24 MHz VGA table, QVGA by default
-  with selectable native VGA; compiled but awaiting matching-sensor validation.
+  with selectable native VGA; community validated on an XF16 PTZ, with target
+  A9 validation still pending.
 - SP0828 (`0x0c`): factory FTY/X5/X6 24 MHz portrait table at 240 x 320;
   hardware validated on XF16.
 
