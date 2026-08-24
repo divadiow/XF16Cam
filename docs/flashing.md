@@ -12,11 +12,13 @@ Only continue when the board matches the photographs in the
 [hardware guide](hardware.md) and the main device is marked `XF16`. Beken, Taixin,
 XR872AT, or other A9 variants are incompatible.
 
-The expected external flash is 1 MiB/8 Mbit (though I think I've seen older devices with 2MiB). Keep a verified factory dump if at
-all possible. Community experiments found that in-circuit SPI clips sometimes
-reported changing IDs such as `13 13`, `8E 80 29`, and `C7 40 14`; compare
-multiple reads and do not trust a dump that is not repeatable. An off-board read
-may be necessary when the rest of the PCB loads the programmer.
+XF16Cam uses a 1 MiB (8 Mbit) flash layout. Cameras with other flash capacities
+have been observed, but they should not be assumed to use this exact layout.
+Keep a verified factory dump if at all possible. Community experiments found
+that in-circuit SPI clips sometimes reported changing IDs such as `13 13`,
+`8E 80 29`, and `C7 40 14`; compare multiple reads and do not trust a dump that
+is not repeatable. An off-board read may be necessary when the rest of the PCB
+loads the programmer.
 
 ## 2. Choose the correct image
 
@@ -52,60 +54,81 @@ Power the camera through its normal regulated 5 V USB input and share ground
 with the adapter. Never put 5 V logic on PB0 or PB1. Desolder the pouch
 battery while wiring or flashing, especially if its condition is unknown.
 
-On the photographed A9 revision, UART is routed through the micro-USB data path,
-so a USB breakout can avoid soldering directly to the PCB:
+On the photographed A9 revision, the flashing UART is routed through the
+micro-USB connector's D- and D+ contacts. They are **UART signals, not USB
+data**. A DIY cable or breakout therefore provides access without soldering to
+the camera PCB:
 
-| Known cable contact | USB–UART adapter / supply |
+| Known cable contact | USB-UART adapter / supply |
 | --- | --- |
-| Green, D− | TX at 3.3 V logic |
-| White, D+ | RX at 3.3 V logic |
+| Green, D− (camera TX/PB0) | RX at 3.3 V logic; GPIO1 pad on the module-removed NodeMCU donor |
+| White, D+ (camera RX/PB1) | TX at 3.3 V logic; GPIO3 pad on the module-removed NodeMCU donor |
 | Black, GND | Common ground |
 | Red, VBUS | Regulated 5 V camera power |
 
 Cheap cable colours and board revisions can differ; verify the contacts before
-applying power. Treat this connector as UART, not normal USB data, and do not
-connect the data pair to a PC USB host and a UART adapter at the same time. The
-[original adapter wiring and photographs](https://www.elektroda.com/rtvforum/topic4074636-90.html#21528571)
-show the confirmed revision.
+applying power. Never connect the D-/D+ pair to a PC USB host and a UART adapter
+at the same time. The [original DIY adapter wiring and photographs](https://www.elektroda.com/rtvforum/topic4074636-90.html#21528571)
+show a working cable made from a stripped micro-USB lead and a CH340-equipped
+NodeMCU board. A normal 3.3 V USB-UART adapter can be used in the same way if
+the camera receives a suitable regulated 5 V supply.
 
-## 4. Back up and write with PhoenixMC
+## 4. Back up and write with Easy Flasher
 
-The XRADIO `PhoenixMC` tools are included in `tools/`. Both the factory
-application and XF16Cam can enter the BootROM through the serial `upgrade`
-command (assuming factory app or original Runtop app is running), so ordinarily there should be no need to ground PB02 and PB03 as bootstrapping.
+Download [BK7231 GUI Flash Tool](https://github.com/openshwprojects/BK7231GUIFlashTool/releases/latest)
+(Easy Flasher) v318 or newer and extract it. This version supports the
+`XR872`/XF16 BootROM directly.
 
-For the conservative first pass in the PhoenixMC GUI:
+For the first installation:
 
-1. Close every terminal using the port, select the camera's COM port, and start
-   at 115200 baud.
-2. Open the debug/read controls and wait for `Open comm OK` so the address and
-   length fields become available.
-3. Read from address `0` for length `100000` (hex). The result must be exactly
-   1,048,576 bytes.
-4. Read it a second time and compare SHA-256 hashes. Keep both verified factory
-   backups somewhere outside this checkout.
-5. Select the complete `xf16cam-xr872-v<version>.img`, choose **Update**, and
-   wait for a successful write result before removing power.
-6. Reboot the camera normally.
+1. Extract the XF16Cam workflow artifact and identify the complete
+   `xf16cam-xr872-v<version>.img` file. Do not use the `-ota.img` file.
+2. Close every terminal using the camera's port. In Easy Flasher, select
+   platform `XR872`, the camera's COM port, and 115200 baud.
+3. Drag the complete `.img` onto the Easy Flasher window. Alternatively, enable
+   **Show advanced options** and use the `...` file button. Do not select
+   **Download latest from Web**; that retrieves firmware from a different
+   project, not XF16Cam.
+4. Select **Firmware backup (read) only** twice. Easy Flasher reads the complete
+   capacity reported by the flash and saves each dump under `backups/`. On the
+   supported target, each dump must be exactly 1,048,576 bytes. Compare their
+   SHA-256 hashes and keep a verified copy somewhere outside this checkout.
+5. With the complete XF16Cam image still selected, choose **Backup and flash
+   new firmware**. Keep power connected until the operation completes.
+6. Remove any recovery straps and reboot the camera normally.
 
-The `100000` length is intentional for this 1 MiB target; generic XRadio guides
-often show `200000` for 2 MiB devices. Use the complete image, never the
-`-ota.img` file.
+Easy Flasher handles the flash address, reads the JEDEC ID, detects the flash
+capacity, validates the XR image structure, and writes the complete `.img` from
+offset zero. No manual address or length is needed. If the detected capacity is
+not 1 MiB, preserve the full backup and confirm the board variant before
+writing this 1 MiB-layout firmware.
 
-PhoenixMC sends `upgrade`, then synchronisation bytes; a receptive application
-answers and reboots into the XR BootROM. XF16Cam deliberately keeps its console
-enabled and the handoff available even if the camera sensor, Wi-Fi, or storage
-has failed. The [protocol investigation](https://www.elektroda.com/rtvforum/topic4074636-150.html#21534886)
+On a normally booting factory application or XF16Cam, Easy Flasher first sends
+the application-level `upgrade` command and then synchronises with the XR
+BootROM. XF16Cam deliberately keeps this console handoff available even if the
+camera sensor, Wi-Fi, or storage has failed. The [protocol investigation](https://www.elektroda.com/rtvforum/topic4074636-150.html#21534886)
 and [console-enable finding](https://www.elektroda.com/rtvforum/topic4074636-150.html#21536774)
-explain why this works after a full power cycle.
+explain the mechanism.
 
-If flash is blank/corrupt and no application can receive `upgrade`, software
-handoff is impossible. Do not guess catalogue XR872ET strap pins: the XF16 uses
-a different package. Restoring the verified 1 MiB image to the desoldered flash
-is the conservative recovery route when UART entry has been lost. The
-[long-running XF16 investigation](https://www.elektroda.com/rtvforum/topic4074636.html)
-documents the BootROM experiments and pitfalls of unstable in-circuit SPI
-writes.
+### PB02/PB03 hardware bootstrap
+
+If flash is blank or corrupt, no application is available to receive
+`upgrade`. The two boxed test pads below are the XF16 board's PB02/PB03 recovery
+straps.
+
+![PB02 and PB03 recovery pads boxed in red on the XF16 A9 PCB](images/xf16-pb02-pb03.jpg)
+
+1. Disconnect camera power.
+2. Temporarily connect both PB02 and PB03 pads to GND.
+3. Apply the camera's normal 5 V power while both pads are low.
+4. Release both pads after power-up, then start or retry the Easy Flasher
+   operation. Do not leave them grounded for the transfer or for normal boot.
+
+This selects the `00` firmware-update bootstrap state at startup. PB02 and PB03
+are also shared with the external flash interface, which is why the temporary
+connections must be removed. The [labelled-pad photograph and original test](https://www.elektroda.com/rtvforum/topic4074636-60.html#21523144)
+show the exact board location. An off-board SPI restore of the verified factory
+backup remains the final recovery route if UART bootstrap cannot communicate.
 
 ## 5. First boot
 
@@ -143,9 +166,10 @@ upgrade
 ```
 
 `wifi ap` restores setup-AP mode. `wifi sta` saves credentials and reboots.
-`upgrade` immediately hands control to the UART BootROM. PhoenixMC normally
+`upgrade` immediately hands control to the UART BootROM. Easy Flasher normally
 sends it automatically. For a manual handoff, issue `upgrade` in the terminal,
-close the terminal so it releases the COM port, and then connect PhoenixMC.
+close the terminal so it releases the COM port, and then start the Easy Flasher
+operation.
 
 Holding the PA20 button for 3 seconds is the no-terminal route back to the open
 setup AP.
@@ -171,9 +195,11 @@ network.
 - **No serial text:** confirm 115200 8N1, common ground, crossed TX/RX, and that
   the adapter uses 3.3 V logic. Check the opposite micro-USB data contact if the
   board revision routes the pair differently.
-- **Uploader cannot synchronise:** close the terminal, reboot normally, and let
-  the uploader send `upgrade` again. If the application is alive, issuing
-  `upgrade` in the console first is a useful diagnostic.
+- **Easy Flasher cannot synchronise:** close the terminal, reboot normally, and
+  let Easy Flasher send `upgrade` again. If the application is alive, issuing
+  `upgrade` in the console first is a useful diagnostic. If it is not alive,
+  use the PB02/PB03 hardware-bootstrap sequence above. Use an off-board SPI
+  restore only if UART bootstrap also fails.
 - **No `XF16CAM` AP:** hold PA20 for 3 seconds. If boot never reaches the XF16Cam
   version line, capture the UART log and use serial/SPI recovery.
 - **No camera sensor:** this should not block management services. The web page

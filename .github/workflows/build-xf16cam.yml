@@ -1,4 +1,4 @@
-name: Build XF16Cam XR872
+name: Build XF16Cam
 
 on:
   push:

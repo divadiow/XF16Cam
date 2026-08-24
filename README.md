@@ -1,6 +1,6 @@
 # XF16Cam
 
-[![Build XF16Cam XR872](https://github.com/divadiow/XF16Cam/actions/workflows/build-xf16cam.yml/badge.svg)](https://github.com/divadiow/XF16Cam/actions/workflows/build-xf16cam.yml)
+[![Build XF16Cam](https://github.com/divadiow/XF16Cam/actions/workflows/build-xf16cam.yml/badge.svg)](https://github.com/divadiow/XF16Cam/actions/workflows/build-xf16cam.yml)
 
 XF16Cam is compact, local network-camera firmware for the 1 MiB-flash A9
 camera built around the XF16/XR872ET-family platform. It replaces the factory
@@ -77,8 +77,11 @@ and more identification detail.
 ## Getting started
 
 1. Open the camera and confirm the XF16 marking and 1 MiB board layout above.
-2. Back up the factory flash, then follow the [serial flashing guide](docs/flashing.md)
-   using the **complete** `xf16cam-xr872-v<version>.img` image.
+2. Follow the [serial flashing guide](docs/flashing.md) to make a full factory
+   backup and write the **complete** `xf16cam-xr872-v<version>.img` with
+   [Easy Flasher](https://github.com/openshwprojects/BK7231GUIFlashTool/releases/latest)
+   in `XR872` mode. On these boards, the flashing UART is routed through the
+   micro-USB connector's D- and D+ contacts; it is not a USB data interface.
 3. After first boot, join the open Wi-Fi network `XF16CAM`. The camera is
    `192.168.4.1` and gives the connected setup device `192.168.4.100`.
 4. Open `http://192.168.4.1/`, scan for your Wi-Fi network, enter its password,

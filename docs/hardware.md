@@ -78,8 +78,8 @@ and the [XR872 product brief](https://github.com/XradioTech/xradiotech-wiki/wiki
 | Setup/wake button | PA20 | Active-low, internal pull-up; wake input 6 |
 | Status LED | PA21 | Firmware-controlled |
 | Camera/SD rail | PA23 | Shared peripheral rail, not a battery disconnect |
-| UART console | PB0 TX, PB1 RX | 115200 8N1; used for logging and recovery |
-| SPI flash | PB2–PB7 | External 1 MiB system flash |
+| UART console | PB0 TX, PB1 RX | 115200 8N1; micro-USB D- is camera TX and D+ is camera RX |
+| SPI flash | PB2–PB7 | External system flash; PB02/PB03 are also sampled as boot straps |
 | SD card | PB16 CMD, PB17 D0, PB18 CLK | One-bit SD mode |
 | Microphone | Internal-codec AMIC | Analogue input, not a GPIO |
 
@@ -87,6 +87,16 @@ The 18-pin camera-connector mapping was confirmed by continuity tracing and GPIO
 walking during the [XF16 investigation](https://www.elektroda.com/rtvforum/topic4074636-270.html#21732686).
 Do not assume that an arbitrary 18-pin module uses the same contact orientation;
 some camera ribbons expose their contacts on the opposite face.
+
+The micro-USB D- contact connects to camera TX/PB0 and therefore goes to a
+3.3 V USB-UART adapter's RX. D+ connects to camera RX/PB1 and goes to adapter
+TX. On the module-removed NodeMCU donor in the
+[DIY adapter photographs](https://www.elektroda.com/rtvforum/topic4074636-90.html#21528571),
+those connections are D- to the GPIO1 pad and D+ to the GPIO3 pad. PB02 and
+PB03 can force the UART update bootstrap when no running application can accept
+`upgrade`: both are held low at power-on and then released. See the
+[flashing guide](flashing.md#pb02pb03-hardware-bootstrap) for the labelled pads
+and recovery sequence.
 
 ## Buttons and LEDs
 
