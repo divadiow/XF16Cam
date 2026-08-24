@@ -153,7 +153,3 @@ This is still experimental:
 - XF16Cam does not estimate percentage or hibernate automatically at low
   voltage.
 - The red LED is not controlled or characterised.
-
-Do not reuse a swollen or damaged pouch cell. Disconnect it, keep it away from
-metal tools, and follow local battery-disposal guidance rather than attempting
-to charge it during development.

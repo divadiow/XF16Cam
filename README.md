@@ -5,7 +5,7 @@
 XF16Cam is compact, local network-camera firmware for the 1 MiB-flash A9
 camera built around the XF16/XR872ET-family platform. It replaces the factory
 cloud application with a responsive web console, browser video or RTSP,
-microphone audio, Wi-Fi setup, and web OTA—all without PSRAM.
+microphone audio, Wi-Fi setup, and web OTA - all without PSRAM.
 
 <table>
   <tr>
