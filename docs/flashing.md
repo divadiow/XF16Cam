@@ -9,11 +9,10 @@ power; a backup and a verified hardware identity make recovery much easier.
 ## 1. Confirm the target
 
 Only continue when the board matches the photographs in the
-[hardware guide](hardware.md) and the main device is marked `XF16` (commonly
-`XF16 PB380EA6341`). An A9 case alone is not enough. Images for Beken, Taixin,
+[hardware guide](hardware.md) and the main device is marked `XF16`. Beken, Taixin,
 XR872AT, or other A9 variants are incompatible.
 
-The expected external flash is 1 MiB/8 Mbit. Keep a verified factory dump if at
+The expected external flash is 1 MiB/8 Mbit (though I think I've seen older devices with 2MiB). Keep a verified factory dump if at
 all possible. Community experiments found that in-circuit SPI clips sometimes
 reported changing IDs such as `13 13`, `8E 80 29`, and `C7 40 14`; compare
 multiple reads and do not trust a dump that is not repeatable. An off-board read
@@ -50,7 +49,7 @@ control. At PCB level, use **3.3 V UART logic**:
 | GND | GND |
 
 Power the camera through its normal regulated 5 V USB input and share ground
-with the adapter. Never put 5 V logic on PB0 or PB1. Disconnect the pouch
+with the adapter. Never put 5 V logic on PB0 or PB1. Desolder the pouch
 battery while wiring or flashing, especially if its condition is unknown.
 
 On the photographed A9 revision, UART is routed through the micro-USB data path,
@@ -73,7 +72,7 @@ show the confirmed revision.
 
 The XRADIO `PhoenixMC` tools are included in `tools/`. Both the factory
 application and XF16Cam can enter the BootROM through the serial `upgrade`
-command, so **do not strap PB2/PB3** on a normally booting camera.
+command (assuming factory app or original Runtop app is running), so ordinarily there should be no need to ground PB02 and PB03 as bootstrapping.
 
 For the conservative first pass in the PhoenixMC GUI:
 
