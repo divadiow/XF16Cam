@@ -137,6 +137,7 @@ static void xf16cam_http_flash_info(uint32_t *jedec, uint32_t *size)
 __xip_rodata static const char g_page_head[] =
 	"<!doctype html><html><head><meta charset=utf-8>"
 	"<meta name=viewport content='width=device-width,initial-scale=1'>"
+	"<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPHN2ZyBmaWxsPSIjMDAwMDAwIiB3aWR0aD0iMzJweCIgaGVpZ2h0PSIzMnB4IiB2aWV3Qm94PSIwIDAgMjQgMjQiIGlkPSJjY3R2LWNhbWVyYSIgZGF0YS1uYW1lPSJMaW5lIENvbG9yIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGNsYXNzPSJpY29uIGxpbmUtY29sb3IiPjxwYXRoIGlkPSJwcmltYXJ5IiBkPSJNMTYuMTcsMTMuM0ExNS45MiwxNS45MiwwLDAsMSwxOCwyMUg2YTE1LjkyLDE1LjkyLDAsMCwxLDEuODMtNy43LDYsNiwwLDAsMCw4LjM0LDBaIiBzdHlsZT0iZmlsbDogbm9uZTsgc3Ryb2tlOiByZ2IoMCwgMCwgMCk7IHN0cm9rZS1saW5lY2FwOiByb3VuZDsgc3Ryb2tlLWxpbmVqb2luOiByb3VuZDsgc3Ryb2tlLXdpZHRoOiAyOyI+PC9wYXRoPjxjaXJjbGUgaWQ9InByaW1hcnktMiIgZGF0YS1uYW1lPSJwcmltYXJ5IiBjeD0iMTIiIGN5PSI5IiByPSI2IiBzdHlsZT0iZmlsbDogbm9uZTsgc3Ryb2tlOiByZ2IoMCwgMCwgMCk7IHN0cm9rZS1saW5lY2FwOiByb3VuZDsgc3Ryb2tlLWxpbmVqb2luOiByb3VuZDsgc3Ryb2tlLXdpZHRoOiAyOyI+PC9jaXJjbGU+PHBhdGggaWQ9InNlY29uZGFyeSIgZD0iTTE0LDlhMiwyLDAsMSwxLTItMkEyLDIsMCwwLDEsMTQsOVpNNCwyMUgyMCIgc3R5bGU9ImZpbGw6IG5vbmU7IHN0cm9rZTogcmdiKDQ0LCAxNjksIDE4OCk7IHN0cm9rZS1saW5lY2FwOiByb3VuZDsgc3Ryb2tlLWxpbmVqb2luOiByb3VuZDsgc3Ryb2tlLXdpZHRoOiAyOyI+PC9wYXRoPjwvc3ZnPg==\">"
 	"<title>XF16Cam</title><style>"
 	":root{--ink:#18212b;--muted:#647281;--line:#dbe2e8;--brand:#176b5b;--bg:#edf2f4}"
 	"*{box-sizing:border-box}body{font:15px system-ui;margin:0;background:var(--bg);color:var(--ink)}"
@@ -366,22 +367,24 @@ static void xf16cam_http_page(int fd)
 					  "data.set(button.name,button.value);try{await fetch(form.action,{method:'POST',body:data})}"
 					  "finally{button.disabled=false}return false}</script>"
 					  );
+	int led_on = xf16cam_board_get_led_on();
 	length = snprintf(dynamic, sizeof(dynamic),
 	                  "<form class=led method=post action=/api/led onsubmit='return submitLed(event,this)'>"
 	                  "<button name=led_on value=%s>"
-					  "Turn LED %s</button> "
-					  , xf16cam_board_get_led_on() ? "false" : "true"
-					  , xf16cam_board_get_led_on() ? "off" : "on"
-	                  "</form>");
+					  "Turn LED %s</button></form>"
+					  , led_on ? "'false'" : "'true'"
+					  , led_on ? "off" : "on"
+	                  );
 	xf16cam_http_send_all(fd, dynamic, length);
 	//Add IR LED control button for PTZ version
+	int ir_led_on = xf16cam_board_get_ir_led_on();
 	length = snprintf(dynamic, sizeof(dynamic),
 	                  "<form class=led method=post action=/api/ir_led onsubmit='return submitLed(event,this)'>"
 	                  "<button name=ir_led_on value=%s>"
-					  "Turn IR LED %s</button> "
-					  , xf16cam_board_get_ir_led_on() ? "false" : "true"
-					  , xf16cam_board_get_ir_led_on() ? "off" : "on"
-	                  "</form>");
+					  "Turn IR LED %s</button></form>"
+					  , ir_led_on ? "'false'" : "'true'"
+					  , ir_led_on ? "off" : "on"
+	                  );
 	xf16cam_http_send_all(fd, dynamic, length);
 	//Add PTZ control buttons for PTZ version
 	XF16CAM_HTTP_SEND_LITERAL(fd,
@@ -950,8 +953,7 @@ static int xf16cam_http_handle(int fd)
 		xf16cam_http_led_json(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/ir_led") == 0) {
 		xf16cam_http_ir_led_json(fd);
-	}
-	else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
 		xf16cam_http_power_json(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifi") == 0) {
 		int invalid = xf16cam_form_value(body, "ssid", ssid, sizeof(ssid)) != 0 ||
