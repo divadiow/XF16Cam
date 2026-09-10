@@ -10,6 +10,7 @@
 
 #include "xf16cam_board.h"
 #include "xf16cam_config.h"
+#include "xf16cam_log.h"
 #include "xf16cam_media.h"
 #include "xf16cam_storage.h"
 #include "xf16cam_sensor.h"
@@ -127,6 +128,7 @@ static void xf16cam_board_reboot(void)
 	if (xf16cam_storage_unmount() != 0)
 		printf("xf16cam board: SD eject failed before reboot\n");
 	OS_MSleep(250);
+	xf16cam_log_flush();	/* the reason printed above must leave the board */
 	HAL_PRCM_SetCPUABootFlag(PRCM_CPUA_BOOT_FROM_COLD_RESET);
 	HAL_WDG_Reboot();
 }
@@ -154,6 +156,8 @@ static void xf16cam_board_task(void *arg)
 		int mode_pressed = 0;
 		#endif
 		int reset_pressed = xf16cam_board_reset_button_pressed();
+
+		xf16cam_log_poll();	/* one UDP datagram of console output, if any */
 
 		// if (OS_TicksToMSecs(OS_GetTicks()) > 2U * 60U * 60U * 1000U) {
 		// 	printf("xf16cam board: rebooting after 6 hours uptime\n");
