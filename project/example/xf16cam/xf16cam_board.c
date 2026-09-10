@@ -32,7 +32,11 @@
 #define XF16CAM_BUTTON_POLL_MS       (50)
 #define XF16CAM_BUTTON_DEBOUNCE_MS   (100)
 #define XF16CAM_RESET_HOLD_MS        (3000)
-#define XF16CAM_BOARD_STACK_SIZE     (1024)
+/* Upstream runs this task on 1 KiB. Ours also drains the console mirror
+ * (256-byte chunk), flushes it and unmounts the SD card on the watchdog
+ * reboot path, none of which is in the measured high-water mark, so keep
+ * the 2 KiB and read the System tab's spare-stack figure before trimming. */
+#define XF16CAM_BOARD_STACK_SIZE     (2*1024)
 #define XF16CAM_CAPTURE_STALL_MS     (30U * 1000U)
 #ifndef NO_PTZ
 #define XF16CAM_CDS_CHANNEL           ADC_CHANNEL_5
@@ -156,19 +160,22 @@ static void xf16cam_board_task(void *arg)
 		// 	xf16cam_board_reboot();
 		// }
 
-		// Fallback recovery if capture stalls before the 2-hour mark
-		// if (xf16cam_media_active_clients() > 0) {
-		// 	uint32_t now = OS_TicksToMSecs(OS_GetTicks());
-		// 	uint32_t last = xf16cam_media_info()->last_frame_ms;
+		// Fallback recovery if capture stalls before the 2-hour mark.
+		// Only sessions that hold the camera count: last_frame_ms is
+		// re-stamped when the camera is acquired, so a client that is
+		// connected but not yet playing cannot trip this.
+		if (xf16cam_media_capturing() > 0) {
+			uint32_t now = OS_TicksToMSecs(OS_GetTicks());
+			uint32_t last = xf16cam_media_info()->last_frame_ms;
 
-		// 	if (last == 0)
-		// 		last = now;
-		// 	if (now - last >= XF16CAM_CAPTURE_STALL_MS) {
-		// 		printf("xf16cam board: no camera frames for %lus with clients connected; rebooting\n",
-		// 		       (unsigned long)((now - last) / 1000U));
-		// 		xf16cam_board_reboot();
-		// 	}
-		// }
+			if (last == 0)
+				last = now;
+			if (now - last >= XF16CAM_CAPTURE_STALL_MS) {
+				printf("xf16cam board: no camera frames for %lus with clients connected; rebooting\n",
+				       (unsigned long)((now - last) / 1000U));
+				xf16cam_board_reboot();
+			}
+		}
 
 		if (g_board_sleeping) {
 			if (led) {
@@ -323,9 +330,6 @@ int xf16cam_board_get_led_on(void)
 {
 	return HAL_GPIO_ReadPin(XF16CAM_GPIO_PORT, XF16CAM_LED_PIN) == GPIO_PIN_HIGH;
 }
-
-#ifndef NO_PTZ
-#endif
 
 //IR LED control functions for PTZ version
 __xip_text
