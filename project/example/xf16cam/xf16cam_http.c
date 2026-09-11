@@ -15,6 +15,7 @@
 #include "net/wlan/wlan.h"
 #include "net/wlan/wlan_ext_req.h"
 #include "ota/ota.h"
+#include "sys/sram_heap.h"
 #include "common/framework/net_ctrl.h"
 #include "common/framework/sysinfo.h"
 
@@ -22,6 +23,7 @@
 #include "xf16cam_audio.h"
 #include "xf16cam_board.h"
 #include "xf16cam_http.h"
+#include "xf16cam_log.h"
 #include "xf16cam_media.h"
 #include "xf16cam_net.h"
 #include "xf16cam_power.h"
@@ -29,6 +31,7 @@
 #include "xf16cam_storage.h"
 #include "xf16cam_ptz.h"
 #include "xf16cam_version.h"
+#include "xf16cam_xip.h"
 
 #define XF16CAM_HTTP_PORT         (80)
 #define XF16CAM_HTTP_REQUEST_SIZE (2048)
@@ -65,8 +68,6 @@ static uint32_t g_flash_size;
 
 static void xf16cam_http_message(int fd, const char *status, const char *message);
 
-extern void heap_get_space(uint8_t **start, uint8_t **end, uint8_t **current);
-
 __xip_text
 __attribute__((noinline))
 static const char *xf16cam_http_boot_reason(void)
@@ -99,17 +100,6 @@ static int xf16cam_http_chip_temperature(void)
 	value = temperature.Temperature;
 	return value >= 0 ? (int)((value * 10 + 8) / 16) :
 	                    -(int)((-value * 10 + 8) / 16);
-}
-
-__xip_text
-static size_t xf16cam_http_heap_headroom(void)
-{
-	uint8_t *start;
-	uint8_t *end;
-	uint8_t *current;
-
-	heap_get_space(&start, &end, &current);
-	return (size_t)(end - current);
 }
 
 __attribute__((noinline))
@@ -181,6 +171,27 @@ static void xf16cam_http_send_text(int fd, const char *text)
 	xf16cam_http_send_all(fd, text, strlen(text));
 }
 
+/* Static markup and the status/body pair of an error page are the other two
+ * kinds of literal in this file. Like XF16CAM_XIP_FORMAT they belong in XIP
+ * flash, not the app slot -- see xf16cam_xip.h for why. Every string in this
+ * file should go through one of the three macros.
+ *
+ * XF16CAM_HTTP_MESSAGE gives each of the ~45 call sites its own copy of its
+ * status string rather than sharing one deduplicated "409 Conflict", trading
+ * flash there is plenty of for the slot CI gates on. */
+#define XF16CAM_HTTP_SEND_LITERAL(fd, literal) do { \
+	__xip_rodata static const char XF16CAM_XIP_JOIN(g_http_text_, __LINE__)[] = literal; \
+	xf16cam_http_send_all((fd), XF16CAM_XIP_JOIN(g_http_text_, __LINE__), \
+	                      sizeof(XF16CAM_XIP_JOIN(g_http_text_, __LINE__)) - 1); \
+} while (0)
+
+#define XF16CAM_HTTP_MESSAGE(fd, status, message) do { \
+	__xip_rodata static const char XF16CAM_XIP_JOIN(g_http_st_, __LINE__)[] = status; \
+	__xip_rodata static const char XF16CAM_XIP_JOIN(g_http_ms_, __LINE__)[] = message; \
+	xf16cam_http_message((fd), XF16CAM_XIP_JOIN(g_http_st_, __LINE__), \
+	                     XF16CAM_XIP_JOIN(g_http_ms_, __LINE__)); \
+} while (0)
+
 __xip_text
 static void xf16cam_http_runtime(int fd, char *dynamic, size_t size)
 {
@@ -190,12 +201,12 @@ static void xf16cam_http_runtime(int fd, char *dynamic, size_t size)
 	int length;
 
 	if (temperature == INT_MIN)
-		snprintf(temperature_text, sizeof(temperature_text), "Unavailable");
+		XF16CAM_XIP_FORMAT(temperature_text, sizeof(temperature_text), "Unavailable");
 	else
-		snprintf(temperature_text, sizeof(temperature_text), "%s%d.%d &deg;C",
+		XF16CAM_XIP_FORMAT(temperature_text, sizeof(temperature_text), "%s%d.%d &deg;C",
 		         temperature < 0 ? "-" : "", abs(temperature) / 10,
 		         abs(temperature) % 10);
-	length = snprintf(dynamic, size,
+	length = XF16CAM_XIP_FORMAT(dynamic, size,
 	                  "<section class=card><h2>Runtime</h2><div class=grid>"
 	                  "<b>Uptime</b><span>%lu days %02lu:%02lu:%02lu</span>"
 	                  "<b>Boot reason</b><span>%s</span>"
@@ -210,19 +221,11 @@ static void xf16cam_http_runtime(int fd, char *dynamic, size_t size)
 		xf16cam_http_send_all(fd, dynamic, (size_t)length);
 }
 
-#define XF16CAM_HTTP_JOIN_(a, b) a##b
-#define XF16CAM_HTTP_JOIN(a, b) XF16CAM_HTTP_JOIN_(a, b)
-#define XF16CAM_HTTP_SEND_LITERAL(fd, literal) do { \
-	__xip_rodata static const char XF16CAM_HTTP_JOIN(g_http_text_, __LINE__)[] = literal; \
-	xf16cam_http_send_all((fd), XF16CAM_HTTP_JOIN(g_http_text_, __LINE__), \
-	                      sizeof(XF16CAM_HTTP_JOIN(g_http_text_, __LINE__)) - 1); \
-} while (0)
-
 __xip_text
 static void xf16cam_http_begin(int fd, const char *status, const char *type)
 {
 	char header[192];
-	int length = snprintf(header, sizeof(header),
+	int length = XF16CAM_XIP_FORMAT(header, sizeof(header),
 	                      "HTTP/1.1 %s\r\nContent-Type: %s\r\n"
 	                      "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
 	                      status, type);
@@ -234,7 +237,7 @@ static void xf16cam_http_begin_length(int fd, const char *status, const char *ty
 	                                  size_t body_length)
 {
 	char header[224];
-	int length = snprintf(header, sizeof(header),
+	int length = XF16CAM_XIP_FORMAT(header, sizeof(header),
 	                      "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
 	                      "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
 	                      status, type, (unsigned long)body_length);
@@ -263,7 +266,7 @@ static void xf16cam_http_send_escaped(int fd, const uint8_t *text, size_t length
 		} else if ((text[i] >= 0x20 && text[i] < 0x7f) || text[i] >= 0x80) {
 			xf16cam_http_send_all(fd, &text[i], 1);
 		} else if (json) {
-			snprintf(encoded, sizeof(encoded), "\\u%04x", text[i]);
+			XF16CAM_XIP_FORMAT(encoded, sizeof(encoded), "\\u%04x", text[i]);
 			xf16cam_http_send_text(fd, encoded);
 		}
 	}
@@ -284,22 +287,30 @@ static void xf16cam_http_page(int fd)
 	char camera_output[24];
 	char dynamic[640];
 	int length;
+	/* Hoisted out of the Device-grid format arguments below: a #ifdef cannot
+	 * appear inside a macro invocation, and XF16CAM_XIP_FORMAT is a macro.
+	 * xf16cam_http_system_json() resolves the same split the same way. */
+#ifdef NO_PTZ
+	const char *mode_button = xf16cam_board_mode_button_pressed() ? "pressed" : "released";
+#else
+	const char *mode_button = "N/A";
+#endif
 
 	if (camera_available) {
-		snprintf(camera_detail, sizeof(camera_detail), "%s &middot; %ux%u JPEG",
+		XF16CAM_XIP_FORMAT(camera_detail, sizeof(camera_detail), "%s &middot; %ux%u JPEG",
 		         xf16cam_sensor_name(), (unsigned int)xf16cam_sensor_width(),
 		         (unsigned int)xf16cam_sensor_height());
-		snprintf(camera_output, sizeof(camera_output), "%ux%u",
+		XF16CAM_XIP_FORMAT(camera_output, sizeof(camera_output), "%ux%u",
 		         (unsigned int)xf16cam_sensor_width(),
 		         (unsigned int)xf16cam_sensor_height());
 	} else {
-		snprintf(camera_detail, sizeof(camera_detail), "No supported sensor detected");
-		snprintf(camera_output, sizeof(camera_output), "Unavailable");
+		XF16CAM_XIP_FORMAT(camera_detail, sizeof(camera_detail), "No supported sensor detected");
+		XF16CAM_XIP_FORMAT(camera_output, sizeof(camera_output), "Unavailable");
 	}
 
 	xf16cam_http_begin(fd, "200 OK", "text/html; charset=utf-8");
 	xf16cam_http_send_text(fd, g_page_head);
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "<header><div><h1>XF16Cam</h1><div class=meta>Firmware %s</div></div>"
 	                  "<div><span class=pill>%s</span> <span class=meta>%s</span></div></header><main>"
 	                  "<section class=viewer><div class=viewerTop><div><b>Live camera</b>"
@@ -319,7 +330,7 @@ static void xf16cam_http_page(int fd)
 			XF16CAM_HTTP_SEND_LITERAL(fd,
 				                  "<div class=empty><b>Camera unavailable</b><p>Connect a sensor and reboot.</p></div></div>");
 	} else if (camera_available) {
-		length = snprintf(dynamic, sizeof(dynamic),
+		length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 		                  "<div class=rtsp><a href='rtsp://%s:8554/stream'>rtsp://%s:8554/stream</a>"
 		                  "<br><small>Open this address in VLC or another RTSP player.</small></div></div>",
 		                  xf16cam_net_ip(), xf16cam_net_ip());
@@ -368,7 +379,7 @@ static void xf16cam_http_page(int fd)
 					  "finally{button.disabled=false}return false}</script>"
 					  );
 	int led_on = xf16cam_board_get_led_on();
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "<form class=led method=post action=/api/led onsubmit='return submitLed(event,this)'>"
 	                  "<button name=led_on value=%s>"
 					  "Turn LED %s</button></form>"
@@ -378,7 +389,7 @@ static void xf16cam_http_page(int fd)
 	xf16cam_http_send_all(fd, dynamic, length);
 	//Add IR LED control button for PTZ version
 	int ir_led_on = xf16cam_board_get_ir_led_on();
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "<form class=led method=post action=/api/ir_led onsubmit='return submitLed(event,this)'>"
 	                  "<button name=ir_led_on value=%s>"
 					  "Turn IR LED %s</button></form>"
@@ -408,7 +419,7 @@ static void xf16cam_http_page(int fd)
 	                  "<div id=live class=panel><section class=card><h2>Camera</h2><div class=grid>"
 	                  "<b>Sensor</b><span>");
 	xf16cam_http_send_text(fd, xf16cam_sensor_name());
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "</span><b>JPEG output</b><span>%s</span><b>Stream mode</b><span>%s</span>"
 	                  "<b>JPEG body buffer</b><span>%lu bytes</span><b>Frames captured</b><span>%lu</span>"
 	                  "<b>Largest JPEG body</b><span>%lu bytes</span><b>Capture errors</b><span>%lu</span></div>",
@@ -434,7 +445,7 @@ static void xf16cam_http_page(int fd)
 	}
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "%s</span><b>Peak level</b><span><span id=mic>%u</span>/32768</span></div></section></div>",
 	                  !audio->available ? "AMIC unavailable" :
 	                  audio->active ? "AMIC active, PCMU/8000" : "AMIC ready (on demand)", audio->peak);
@@ -457,7 +468,7 @@ static void xf16cam_http_page(int fd)
 	                  "<div id=storage class=panel><section class='card wide'><h2>SD card</h2><div class=grid>"
 	                  "<b>Status</b><span>");
 	if (storage->mounted) {
-		length = snprintf(dynamic, sizeof(dynamic),
+		length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 		                  "Mounted</span><b>Capacity</b><span>%lu MiB</span>"
 		                  "<b>Free space</b><span>%lu MiB</span></div>",
 		                  (unsigned long)storage->total_mb, (unsigned long)storage->free_mb);
@@ -473,34 +484,34 @@ static void xf16cam_http_page(int fd)
 	                  "<button type=submit>Format FAT32</button></form>"
 	                  "<small>Formatting permanently erases the card. Ejecting lets the shared PA23 camera/SD rail power down while idle.</small></section></div>"
 	                  "<div id=system class=panel><section class=card><h2>Device</h2><div class=grid>");
-	length = snprintf(dynamic, sizeof(dynamic),
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
+	                  "<b>DHCP hostname</b><span>%s</span>"
 	                  "<b>Network mode</b><span>%s</span><b>IP address</b><span>%s</span>"
 	                  "<b>Wi-Fi MAC</b><span>%02X:%02X:%02X:%02X:%02X:%02X (eFuse)</span>"
-	                  "<b>Heap top reserve</b><span>%lu bytes</span><b>Flash JEDEC ID</b><span>%02lX %02lX %02lX</span>"
+	                  "<b>Available SRAM heap</b><span>%lu bytes</span><b>Flash JEDEC ID</b><span>%02lX %02lX %02lX</span>"
 	                  "<b>Flash capacity</b><span>%lu KiB</span><b>Mode button</b><span>PA15 (%s)</span>"
 	                  "<b>Setup button</b><span>PA20 (%s)</span>",
+	                  xf16cam_net_hostname(),
 	                  xf16cam_net_mode() == XF16CAM_WIFI_STA ? "Station" : "Open AP", xf16cam_net_ip(),
 	                  sysinfo->mac_addr[0], sysinfo->mac_addr[1], sysinfo->mac_addr[2],
 	                  sysinfo->mac_addr[3], sysinfo->mac_addr[4], sysinfo->mac_addr[5],
-	                  (unsigned long)xf16cam_http_heap_headroom(),
+	                  (unsigned long)sram_free_heap_size(),
 	                  (unsigned long)(g_flash_jedec & 0xff),
 	                  (unsigned long)((g_flash_jedec >> 8) & 0xff),
 	                  (unsigned long)((g_flash_jedec >> 16) & 0xff),
-	                  (unsigned long)(g_flash_size / 1024),
-#ifdef NO_PTZ
-	                  xf16cam_board_mode_button_pressed() ? "pressed" : "released",
-#else
-	                  "N/A",
-#endif
+	                  (unsigned long)(g_flash_size / 1024), mode_button,
 	                  xf16cam_board_reset_button_pressed() ? "pressed" : "released");
-	xf16cam_http_send_all(fd, dynamic, length);
-	length = snprintf(dynamic, sizeof(dynamic),
+	if (length > 0 && (size_t)length < sizeof(dynamic))
+		xf16cam_http_send_all(fd, dynamic, (size_t)length);
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
 	                  "<b>HTTP stack spare</b><span>%lu bytes</span>"
 	                  "<b>Audio stack spare</b><span>%lu bytes</span>"
-	                  "<b>Board stack spare</b><span>%lu bytes</span></div></section>",
+	                  "<b>Board stack spare</b><span>%lu bytes</span>"
+					  "<b>Crash task name</b><span>%s</span></div></section>",
 	                  (unsigned long)OS_ThreadGetStackMinFreeSize(&g_http_thread),
 	                  (unsigned long)xf16cam_audio_stack_min_free(),
-	                  (unsigned long)xf16cam_board_stack_min_free());
+	                  (unsigned long)xf16cam_board_stack_min_free(),
+					  xf16cam_board_get_crash_task_name());
 	xf16cam_http_send_all(fd, dynamic, length);
 	xf16cam_http_runtime(fd, dynamic, sizeof(dynamic));
 
@@ -529,7 +540,7 @@ static void xf16cam_http_page(int fd)
 	                  "</div></section><section class=card><h2>Power</h2><div class=grid>"
 	                  "<b>Battery input</b><span id=battery>");
 	if (power->valid) {
-		length = snprintf(dynamic, sizeof(dynamic), "%u mV (raw %u, approx.)",
+		length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic), "%u mV (raw %u, approx.)",
 		                  power->millivolts, power->raw);
 		xf16cam_http_send_all(fd, dynamic, length);
 	} else {
@@ -537,10 +548,16 @@ static void xf16cam_http_page(int fd)
 	}
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</span><b>Charging</b><span>Unknown</span>"
-	                  "</div><button type=button onclick=measurePower()>Measure voltage</button>"
+	                  "</div><button type=button onclick=measurePower()>Measure voltage</button>");
+	#ifdef NO_PTZ
+	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<form method=post action=/api/hibernate onsubmit=\"return confirm('Hibernate? Press PA20 to wake.')\">"
-	                  "<button type=submit>Hibernate</button></form>"
-	                  "<small>Approximate; no auto cutoff.</small></section>");
+	                  "<button type=submit>Hibernate</button></form>");
+	#endif
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<form method=post action=/api/reboot onsubmit=\"return confirm('Reboot now?')\">"
+	                  "<button type=submit>Reboot</button></form>"
+	                  "<small>Voltage is approximate; no auto cutoff. Rebooting drops streams; settings are kept.</small></section>");
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<section class='card wide'><h2>Firmware update</h2><p>Choose an OTA image and keep power connected.</p>"
 	                  "<input id=ota type=file accept=.img><button id=otaInstall class=primary type=button onclick=update()>Install update</button> <span id=up aria-live=polite></span></section></div>"
@@ -578,7 +595,7 @@ static void xf16cam_http_led_json(int fd)
 {
 	int led_on = xf16cam_board_get_led_on();
 	char body[64];
-	int length = snprintf(body, sizeof(body),
+	int length = XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                      "{\"led_on\":%s}",
 	                      led_on ? "true" : "false");
 
@@ -591,7 +608,7 @@ static void xf16cam_http_ir_led_json(int fd)
 {
 	int ir_led_on = xf16cam_board_get_ir_led_on();
 	char body[64];
-	int length = snprintf(body, sizeof(body),
+	int length = XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                      "{\"ir_led_on\":%s}",
 	                      ir_led_on ? "true" : "false");
 
@@ -604,7 +621,7 @@ static void xf16cam_http_audio_json(int fd)
 {
 	const XF16CamAudioInfo *audio = xf16cam_audio_info();
 	char body[128];
-	int length = snprintf(body, sizeof(body),
+	int length = XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                      "{\"available\":%s,\"active\":%s,\"peak\":%u,\"mean\":%u,\"packets\":%lu,\"read_errors\":%lu}",
 	                      audio->available ? "true" : "false", audio->active ? "true" : "false", audio->peak, audio->mean,
 	                      (unsigned long)audio->packets, (unsigned long)audio->read_errors);
@@ -621,16 +638,142 @@ static void xf16cam_http_power_json(int fd)
 	int length;
 
 	if (xf16cam_power_measure() != 0) {
-		xf16cam_http_message(fd, "503 Service Unavailable", "Battery read failed.");
+		XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable", "Battery read failed.");
 		return;
 	}
 	power = xf16cam_power_info();
-	length = snprintf(body, sizeof(body),
+	length = XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                  "{\"raw\":%u,\"millivolts\":%u,\"calibrated\":false}",
 	                  power->raw, power->millivolts);
 	xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
 	xf16cam_http_send_all(fd, body, length);
 }
+
+/* Streamed like the scan endpoint: one small buffer reused for every chunk
+ * keeps this off the 4 KiB HTTP stack. "Connection: close" delimits the body,
+ * so the missing Content-Length is deliberate. */
+__xip_text
+static void xf16cam_http_system_chunk(int fd, char *body, size_t size, int length)
+{
+	if (length > 0 && (size_t)length < size)
+		xf16cam_http_send_all(fd, body, length);
+}
+
+__xip_text
+static void xf16cam_http_system_json(int fd)
+{
+	const XF16CamConfig *config = xf16cam_config_get();
+	const XF16CamAudioInfo *audio = xf16cam_audio_info();
+	const XF16CamMediaInfo *media = xf16cam_media_info();
+	const XF16CamStorageInfo *storage = xf16cam_storage_info();
+	const XF16CamPowerInfo *power = xf16cam_power_info();
+	const struct sysinfo *sysinfo = sysinfo_get();
+	int temperature = xf16cam_http_chip_temperature();
+	uint32_t uptime = OS_TicksToMSecs(OS_GetTicks()) / 1000U;
+	/* Worst-case chunk is the sensor/media one at ~210 bytes with maximal
+	 * counters, so 256 keeps real headroom. A chunk that overflows is
+	 * dropped whole, which would silently return valid but incomplete JSON. */
+	char body[256];
+	char temperature_text[16];
+	const char *mode_button;
+
+#ifdef NO_PTZ
+	mode_button = xf16cam_board_mode_button_pressed() ? "true" : "false";
+#else
+	mode_button = "null";	/* PTZ boards have no mode button */
+#endif
+	if (temperature == INT_MIN)
+		XF16CAM_XIP_FORMAT(temperature_text, sizeof(temperature_text), "null");
+	else
+		XF16CAM_XIP_FORMAT(temperature_text, sizeof(temperature_text), "%d", temperature);
+
+	xf16cam_http_begin(fd, "200 OK", "application/json");
+
+	/* Flash identity comes from the values cached at startup. Never call
+	 * xf16cam_http_flash_info() here: it disables flash while it runs. */
+	xf16cam_http_system_chunk(fd, body, sizeof(body),
+	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+	                  "{\"ver\":\"" XF16CAM_VERSION "\",\"mode\":\"%s\",\"ip\":\"%s\","
+	                  "\"host\":\"%s\","
+	                  "\"mac\":\"%02X%02X%02X%02X%02X%02X\",\"up\":%lu,"
+	                  "\"boot\":\"%s\",\"temp\":%s,\"heap\":%lu,",
+	                  xf16cam_net_mode() == XF16CAM_WIFI_STA ? "sta" : "ap",
+	                  xf16cam_net_ip(), xf16cam_net_hostname(),
+	                  sysinfo->mac_addr[0], sysinfo->mac_addr[1],
+	                  sysinfo->mac_addr[2], sysinfo->mac_addr[3],
+	                  sysinfo->mac_addr[4], sysinfo->mac_addr[5],
+	                  (unsigned long)uptime, xf16cam_http_boot_reason(),
+	                  temperature_text,
+	                  (unsigned long)sram_free_heap_size()));
+
+	xf16cam_http_system_chunk(fd, body, sizeof(body),
+	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+	                  "\"flash\":{\"id\":\"%02lX%02lX%02lX\",\"kib\":%lu},"
+	                  "\"stack\":{\"http\":%lu,\"audio\":%lu,\"board\":%lu},"
+	                  "\"btn\":{\"mode\":%s,\"setup\":%s},"
+	                  "\"bat\":{\"valid\":%s,\"raw\":%u,\"mv\":%u},",
+	                  (unsigned long)(g_flash_jedec & 0xff),
+	                  (unsigned long)((g_flash_jedec >> 8) & 0xff),
+	                  (unsigned long)((g_flash_jedec >> 16) & 0xff),
+	                  (unsigned long)(g_flash_size / 1024),
+	                  (unsigned long)OS_ThreadGetStackMinFreeSize(&g_http_thread),
+	                  (unsigned long)xf16cam_audio_stack_min_free(),
+	                  (unsigned long)xf16cam_board_stack_min_free(),
+	                  mode_button,
+	                  xf16cam_board_reset_button_pressed() ? "true" : "false",
+	                  power->valid ? "true" : "false",
+	                  power->raw, power->millivolts));
+
+	xf16cam_http_system_chunk(fd, body, sizeof(body),
+	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+	                  "\"cam\":{\"name\":\"%s\",\"ok\":%s,\"w\":%u,\"h\":%u,\"vga\":%s},"
+	                  "\"media\":{\"mode\":\"%s\",\"frames\":%lu,\"largest\":%lu,"
+	                  "\"errors\":%lu,\"cap\":%lu,\"last_ms\":%lu,\"clients\":%lu},",
+	                  xf16cam_sensor_name(),
+	                  xf16cam_sensor_available() ? "true" : "false",
+	                  (unsigned int)xf16cam_sensor_width(),
+	                  (unsigned int)xf16cam_sensor_height(),
+	                  xf16cam_sensor_supports_vga() ? "true" : "false",
+	                  config->media_mode == XF16CAM_MEDIA_WEB ? "web" : "rtsp",
+	                  (unsigned long)media->frames,
+	                  (unsigned long)media->largest_jpeg,
+	                  (unsigned long)media->capture_errors,
+	                  (unsigned long)media->jpeg_capacity,
+	                  (unsigned long)media->last_frame_ms,
+	                  (unsigned long)xf16cam_media_active_clients()));
+
+	xf16cam_http_system_chunk(fd, body, sizeof(body),
+	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+	                  "\"audio\":{\"ok\":%s,\"active\":%s,\"peak\":%u,\"mean\":%u,"
+	                  "\"packets\":%lu,\"errors\":%lu},"
+	                  "\"sd\":{\"mounted\":%s,\"total\":%lu,\"free\":%lu}}",
+	                  audio->available ? "true" : "false",
+	                  audio->active ? "true" : "false",
+	                  audio->peak, audio->mean,
+	                  (unsigned long)audio->packets,
+	                  (unsigned long)audio->read_errors,
+	                  storage->mounted ? "true" : "false",
+	                  (unsigned long)storage->total_mb,
+	                  (unsigned long)storage->free_mb));
+}
+
+#ifdef XF16CAM_NETLOG
+/* The console ring as text. Streamed like /api/system, so no Content-Length;
+ * "Connection: close" delimits the body. */
+__xip_text
+static void xf16cam_http_log(int fd)
+{
+	char chunk[256];
+	uint32_t cursor = 0;
+	int count;
+
+	xf16cam_http_begin(fd, "200 OK", "text/plain; charset=utf-8");
+	while ((count = xf16cam_log_read(&cursor, chunk, sizeof(chunk))) > 0) {
+		if (xf16cam_http_send_all(fd, chunk, (size_t)count) != 0)
+			break;
+	}
+}
+#endif
 
 __xip_text
 static int xf16cam_http_scan(void)
@@ -669,22 +812,22 @@ static void xf16cam_http_scan_json(int fd)
 
 	if (count < 0) {
 		xf16cam_http_begin(fd, "503 Service Unavailable", "application/json");
-		xf16cam_http_send_text(fd, "{\"error\":\"scan failed\"}");
+		XF16CAM_HTTP_SEND_LITERAL(fd, "{\"error\":\"scan failed\"}");
 		return;
 	}
 	xf16cam_http_begin(fd, "200 OK", "application/json");
-	xf16cam_http_send_text(fd, "[");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "[");
 	for (i = 0; i < count; ++i) {
 		wlan_sta_ap_t *ap = &g_scan_results[i];
 		if (i > 0)
-			xf16cam_http_send_text(fd, ",");
-		xf16cam_http_send_text(fd, "{\"ssid\":\"");
+			XF16CAM_HTTP_SEND_LITERAL(fd, ",");
+		XF16CAM_HTTP_SEND_LITERAL(fd, "{\"ssid\":\"");
 		xf16cam_http_send_escaped(fd, ap->ssid.ssid, ap->ssid.ssid_len, 1);
-		snprintf(item, sizeof(item), "\",\"rssi\":%d,\"secure\":%s}",
+		XF16CAM_XIP_FORMAT(item, sizeof(item), "\",\"rssi\":%d,\"secure\":%s}",
 		         ap->level, (ap->wpa_key_mgmt || ap->rsn_key_mgmt) ? "true" : "false");
 		xf16cam_http_send_text(fd, item);
 	}
-	xf16cam_http_send_text(fd, "]");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "]");
 }
 
 __xip_text
@@ -734,8 +877,8 @@ static int xf16cam_form_value(const char *body, const char *key,
 __xip_text
 static void xf16cam_http_message(int fd, const char *status, const char *message)
 {
-	static const char prefix[] = "<section><h1>XF16Cam</h1><p>";
-	static const char suffix[] = "</p><a href='/'>Return</a></section></body></html>";
+	__xip_rodata static const char prefix[] = "<section><h1>XF16Cam</h1><p>";
+	__xip_rodata static const char suffix[] = "</p><a href='/'>Return</a></section></body></html>";
 	size_t length = sizeof(g_page_head) - 1 + sizeof(prefix) - 1 + strlen(message) + sizeof(suffix) - 1;
 
 	xf16cam_http_begin_length(fd, status, "text/html; charset=utf-8", length);
@@ -817,19 +960,20 @@ static int xf16cam_http_ota(int fd, char *body, int body_length, int content_len
 	uint32_t upload_start;
 
 	if (content_length <= 0 || content_length > XF16CAM_OTA_MAX_SIZE) {
-		xf16cam_http_message(fd, "413 Payload Too Large", "Invalid OTA image size.");
+		XF16CAM_HTTP_MESSAGE(fd, "413 Payload Too Large", "Invalid OTA image size.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
 	if (xf16cam_update_begin() != 0) {
-		xf16cam_http_message(fd, "409 Conflict", "Another firmware or settings update is active.");
+		XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "Another firmware or settings update is active.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
 	if (xf16cam_media_quiesce_for_update(XF16CAM_OTA_QUIESCE_MS) != 0) {
 		xf16cam_update_end();
-		xf16cam_http_message(fd, "503 Service Unavailable",
+		XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable",
 		                     "Active media could not stop safely. Close stream clients and try again.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
+	HAL_WDG_Stop();
 	if (ota_push_init() != OTA_STATUS_OK || ota_push_start() != OTA_STATUS_OK)
 		goto fail;
 	upload_start = OS_TicksToMSecs(OS_GetTicks());
@@ -861,7 +1005,7 @@ static int xf16cam_http_ota(int fd, char *body, int body_length, int content_len
 fail:
 	ota_push_stop();
 	xf16cam_update_end();
-	xf16cam_http_message(fd, "400 Bad Request", "OTA verification failed; the current firmware is unchanged.");
+	XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "OTA verification failed; the current firmware is unchanged.");
 	return XF16CAM_HTTP_KEEP_RUNNING;
 }
 
@@ -894,17 +1038,17 @@ static int xf16cam_http_handle(int fd)
 			break;
 	}
 	if (sscanf(g_request, "%7s %95s", method, path) != 2) {
-		xf16cam_http_message(fd, "400 Bad Request", "Malformed request.");
+		XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Malformed request.");
 		return 0;
 	}
 	header_end = strstr(g_request, "\r\n\r\n");
 	if (header_end == NULL) {
-		xf16cam_http_message(fd, "431 Request Header Fields Too Large", "Request headers are too large.");
+		XF16CAM_HTTP_MESSAGE(fd, "431 Request Header Fields Too Large", "Request headers are too large.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
 	body = header_end ? header_end + 4 : g_request + received;
 	if (xf16cam_http_content_length(g_request, header_end, &content_length) != 0) {
-		xf16cam_http_message(fd, "400 Bad Request", "Invalid Content-Length header.");
+		XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Invalid Content-Length header.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
 
@@ -912,7 +1056,7 @@ static int xf16cam_http_handle(int fd)
 		return xf16cam_http_ota(fd, body, received - (body - g_request), content_length);
 
 	if (content_length > (int)(sizeof(g_request) - 1 - (body - g_request))) {
-		xf16cam_http_message(fd, "413 Payload Too Large", "Request body is too large.");
+		XF16CAM_HTTP_MESSAGE(fd, "413 Payload Too Large", "Request body is too large.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 	}
 	while (received - (body - g_request) < content_length) {
@@ -930,29 +1074,35 @@ static int xf16cam_http_handle(int fd)
 		xf16cam_http_page(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.mjpeg") == 0) {
 		if (!xf16cam_sensor_available())
-			xf16cam_http_message(fd, "503 Service Unavailable", "No supported camera sensor is available.");
+			XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable", "No supported camera sensor is available.");
 		else if (xf16cam_config_get()->media_mode != XF16CAM_MEDIA_WEB)
-			xf16cam_http_message(fd, "409 Conflict", "Browser video mode is not active.");
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "Browser video mode is not active.");
 		else if (xf16cam_mjpeg_start(fd) != 0)
-			xf16cam_http_message(fd, "503 Service Unavailable", "A browser video client is already active.");
+			XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable", "Browser video is at the 3-client limit.");
 		else
 			return XF16CAM_HTTP_DETACH_CLIENT;
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.pcmu") == 0) {
 		if (xf16cam_config_get()->media_mode != XF16CAM_MEDIA_WEB &&
 		    xf16cam_sensor_available())
-			xf16cam_http_message(fd, "409 Conflict", "Browser video mode is not active.");
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "Browser video mode is not active.");
 		else if (xf16cam_audio_http_start(fd) != 0)
-			xf16cam_http_message(fd, "503 Service Unavailable", "A browser audio client is already active.");
+			XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable", "Browser audio is at the 3-client limit.");
 		else
 			return XF16CAM_HTTP_DETACH_CLIENT;
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/scan") == 0) {
 		xf16cam_http_scan_json(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/audio") == 0) {
 		xf16cam_http_audio_json(fd);
+#ifdef XF16CAM_NETLOG
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/log") == 0) {
+		xf16cam_http_log(fd);
+#endif
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/led") == 0) {
 		xf16cam_http_led_json(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/ir_led") == 0) {
 		xf16cam_http_ir_led_json(fd);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/system") == 0) {
+		xf16cam_http_system_json(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
 		xf16cam_http_power_json(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifi") == 0) {
@@ -971,28 +1121,28 @@ static int xf16cam_http_handle(int fd)
 			invalid = xf16cam_config_save_sta(ssid, psk) != 0;
 		}
 		if (invalid) {
-			xf16cam_http_message(fd, "400 Bad Request",
+			XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request",
 			                     "Invalid SSID or password. WPA passwords must contain 8 to 63 characters.");
 			return 0;
 		}
 		if (xf16cam_update_begin() != 0) {
-			xf16cam_http_message(fd, "409 Conflict",
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict",
 			                     "Settings were saved, but reboot was deferred by another update.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		xf16cam_http_message(fd, "200 OK", "Settings saved. Rebooting into station mode...");
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Settings saved. Rebooting into station mode...");
 		return XF16CAM_HTTP_COLD_REBOOT;
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ap") == 0) {
 		if (xf16cam_config_save_ap() != 0) {
-			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save open AP mode.");
+			XF16CAM_HTTP_MESSAGE(fd, "500 Internal Server Error", "Could not save open AP mode.");
 			return 0;
 		}
 		if (xf16cam_update_begin() != 0) {
-			xf16cam_http_message(fd, "409 Conflict",
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict",
 			                     "Open AP was saved, but reboot was deferred by another update.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		xf16cam_http_message(fd, "200 OK", "Open AP restored. Rebooting...");
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Open AP restored. Rebooting...");
 		return XF16CAM_HTTP_COLD_REBOOT;
 	} else if(strcmp(method, "POST") == 0 && strcmp(path, "/api/led") == 0) {
 		int led_on = xf16cam_form_value(body, "led_on", mode, sizeof(mode)) == 0 &&
@@ -1009,11 +1159,11 @@ static int xf16cam_http_handle(int fd)
 		    (strcmp(mode, "left") != 0 && strcmp(mode, "right") != 0 &&
 		     strcmp(mode, "up") != 0 && strcmp(mode, "down") != 0 &&
 		     strcmp(mode, "home") != 0)) {
-			xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ direction.");
+			XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Invalid PTZ direction.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		#ifdef NO_PTZ
-		xf16cam_http_message(fd, "501 Not Implemented", "PTZ is not supported on this board.");
+		XF16CAM_HTTP_MESSAGE(fd, "501 Not Implemented", "PTZ is not supported on this board.");
 		return XF16CAM_HTTP_KEEP_RUNNING;
 		#else
 		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) == 0){
@@ -1028,10 +1178,10 @@ static int xf16cam_http_handle(int fd)
 			} else if (strcmp(mode, "home") == 0) {
 				ptz_move_home();
 			} else {
-				xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ direction.");
+				XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Invalid PTZ direction.");
 				return XF16CAM_HTTP_KEEP_RUNNING;
 			}
-			xf16cam_http_message(fd, "200 OK", "PTZ command sent.");
+			XF16CAM_HTTP_MESSAGE(fd, "200 OK", "PTZ command sent.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		#endif
@@ -1039,71 +1189,80 @@ static int xf16cam_http_handle(int fd)
 			if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0 ||
 				xf16cam_config_save_media(strcmp(mode, "web") == 0 ? XF16CAM_MEDIA_WEB :
 										strcmp(mode, "rtsp") == 0 ? XF16CAM_MEDIA_RTSP : 0) != 0) {
-				xf16cam_http_message(fd, "400 Bad Request", "Invalid camera mode.");
+				XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Invalid camera mode.");
 				return XF16CAM_HTTP_KEEP_RUNNING;
 			}
 			if (xf16cam_update_begin() != 0) {
-				xf16cam_http_message(fd, "409 Conflict",
+				XF16CAM_HTTP_MESSAGE(fd, "409 Conflict",
 									"Camera mode was saved, but reboot was deferred by another update.");
 				return XF16CAM_HTTP_KEEP_RUNNING;
 			}
-			xf16cam_http_message(fd, "200 OK", "Camera mode saved. Rebooting...");
+			XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Camera mode saved. Rebooting...");
 			return XF16CAM_HTTP_COLD_REBOOT;
 		} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/resolution") == 0) {
 		XF16CamResolution resolution;
 
 		if (xf16cam_form_value(body, "resolution", mode, sizeof(mode)) != 0 ||
 		    (strcmp(mode, "qvga") != 0 && strcmp(mode, "vga") != 0)) {
-			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera resolution.");
+			XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request", "Invalid camera resolution.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		resolution = strcmp(mode, "vga") == 0 ? XF16CAM_RESOLUTION_VGA :
 		                                              XF16CAM_RESOLUTION_QVGA;
 		if (resolution == XF16CAM_RESOLUTION_VGA && !xf16cam_sensor_supports_vga()) {
-			xf16cam_http_message(fd, "409 Conflict", "The detected sensor does not support VGA output.");
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "The detected sensor does not support VGA output.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		if (xf16cam_config_save_resolution(resolution) != 0) {
-			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save camera resolution.");
+			XF16CAM_HTTP_MESSAGE(fd, "500 Internal Server Error", "Could not save camera resolution.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		if (xf16cam_update_begin() != 0) {
-			xf16cam_http_message(fd, "409 Conflict",
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict",
 			                     "Camera resolution was saved, but reboot was deferred by another update.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		xf16cam_http_message(fd, "200 OK", "Camera resolution saved. Rebooting...");
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Camera resolution saved. Rebooting...");
 		return XF16CAM_HTTP_COLD_REBOOT;
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/refresh") == 0) {
 		if (xf16cam_storage_refresh() != 0)
-			xf16cam_http_message(fd, "503 Service Unavailable", "No readable FAT SD card was found.");
+			XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable", "No readable FAT SD card was found.");
 		else
-			xf16cam_http_message(fd, "200 OK", "SD card mounted. Return to the main page for capacity details.");
+			XF16CAM_HTTP_MESSAGE(fd, "200 OK", "SD card mounted. Return to the main page for capacity details.");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/eject") == 0) {
 		if (xf16cam_storage_unmount() != 0)
-			xf16cam_http_message(fd, "500 Internal Server Error", "SD card eject failed.");
+			XF16CAM_HTTP_MESSAGE(fd, "500 Internal Server Error", "SD card eject failed.");
 		else
-			xf16cam_http_message(fd, "200 OK", "SD card safely ejected.");
+			XF16CAM_HTTP_MESSAGE(fd, "200 OK", "SD card safely ejected.");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/format") == 0) {
 		if (xf16cam_storage_format() != 0)
-			xf16cam_http_message(fd, "500 Internal Server Error", "SD card formatting failed.");
+			XF16CAM_HTTP_MESSAGE(fd, "500 Internal Server Error", "SD card formatting failed.");
 		else
-			xf16cam_http_message(fd, "200 OK", "SD card formatted as FAT32.");
+			XF16CAM_HTTP_MESSAGE(fd, "200 OK", "SD card formatted as FAT32.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/reboot") == 0) {
+		if (xf16cam_update_begin() != 0) {
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "Device is busy.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+	#ifdef NO_PTZ
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/hibernate") == 0) {
 		if (xf16cam_update_begin() != 0) {
-			xf16cam_http_message(fd, "409 Conflict", "Device is busy.");
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict", "Device is busy.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		if (xf16cam_media_quiesce_for_update(XF16CAM_OTA_QUIESCE_MS) != 0) {
 			xf16cam_update_end();
-			xf16cam_http_message(fd, "503 Service Unavailable",
+			XF16CAM_HTTP_MESSAGE(fd, "503 Service Unavailable",
 			                     "Active media could not stop safely. Close stream clients and try again.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		xf16cam_http_message(fd, "200 OK", "Hibernating; press PA20 to wake.");
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Hibernating; press PA20 to wake.");
 		return XF16CAM_HTTP_HIBERNATE;
+	#endif
 	} else {
-		xf16cam_http_message(fd, "404 Not Found", "Page not found.");
+		XF16CAM_HTTP_MESSAGE(fd, "404 Not Found", "Page not found.");
 	}
 	return 0;
 }
@@ -1131,13 +1290,17 @@ static void xf16cam_http_task(void *arg)
 			 * mode and OTA restarts cannot leave a mounted card dirty. */
 			if (xf16cam_storage_unmount() != 0)
 				printf("xf16cam HTTP: SD eject failed before restart\n");
+			xf16cam_log_flush();
 			if (action == XF16CAM_HTTP_OTA_REBOOT)
 				ota_reboot();
+			/* PTZ builds have no hibernate route or button. */
+			#ifdef NO_PTZ
 			if (action == XF16CAM_HTTP_HIBERNATE) {
 				xf16cam_power_hibernate();
 				xf16cam_update_end();
 				continue;
 			}
+			#endif
 			HAL_PRCM_SetCPUABootFlag(PRCM_CPUA_BOOT_FROM_COLD_RESET);
 			HAL_WDG_Reboot();
 		}
@@ -1168,7 +1331,7 @@ int xf16cam_http_start(void)
 	address.sin_port = htons(XF16CAM_HTTP_PORT);
 	address.sin_addr.s_addr = INADDR_ANY;
 	if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-	    listen(server, 2) != 0)
+	    listen(server, XF16CAM_MAX_PARALLEL_CLIENTS) != 0)
 		goto fail_close;
 	if (OS_ThreadCreate(&g_http_thread, "xf16cam-http", xf16cam_http_task,
 	                    (void *)(intptr_t)server, OS_THREAD_PRIO_APP,

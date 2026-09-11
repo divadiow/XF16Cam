@@ -26,6 +26,7 @@
 #include "xf16cam_audio.h"
 #include "xf16cam_board.h"
 #include "xf16cam_http.h"
+#include "xf16cam_log.h"
 #include "xf16cam_media.h"
 #include "xf16cam_net.h"
 #include "xf16cam_rail.h"
@@ -33,6 +34,7 @@
 #include "xf16cam_sensor.h"
 #include "xf16cam_storage.h"
 #include "xf16cam_version.h"
+#include "xf16cam_xip.h"
 
 #define JPEG_ONLINE_EN           (1)
 #define JPEG_BUFFER_COUNT        (1)
@@ -48,6 +50,7 @@
 #define XF16CAM_RTP_AUDIO_SSRC   (0x58463137UL)
 #define XF16CAM_RTSP_HANDSHAKE_MS (10000U)
 #define XF16CAM_RTSP_IO_TIMEOUT_MS (2000)
+#define XF16CAM_RTSP_CLIENT_STACK (3 * 1024)
 
 _Static_assert(JPEG_SRAM_SIZE >= JPEG_BUFFER_COUNT *
 	       (JPEG_BUFF_SIZE + CAMERA_JPEG_HEADER_LEN + 1023U),
@@ -74,10 +77,37 @@ static CAMERA_Mgmt mem_mgmt;
 static OS_Mutex_t g_camera_lock;
 static int g_camera_lock_ready;
 static int g_camera_initialized;
-static uint32_t g_camera_users;
-static OS_Thread_t g_mjpeg_thread;
-static volatile int g_mjpeg_active;
-static volatile int g_rtsp_active;
+static volatile uint32_t g_camera_users;	/* read by the board task */
+/* The capture arena holds a single JPEG buffer; serialize capture-through-send
+ * so a second client can't overwrite it while another client is still reading it. */
+static OS_Mutex_t g_capture_lock;
+static int g_capture_lock_ready;
+typedef struct {
+	OS_Thread_t thread;
+	volatile int active;
+	int fd;
+} XF16CamMediaClient;
+static XF16CamMediaClient g_mjpeg_clients[XF16CAM_MAX_PARALLEL_CLIENTS];
+static XF16CamMediaClient g_rtsp_clients[XF16CAM_MAX_PARALLEL_CLIENTS];
+static volatile uint32_t g_mjpeg_active_count;
+static volatile uint32_t g_rtsp_active_count;
+
+__xip_text
+uint32_t xf16cam_media_active_clients(void)
+{
+	return g_mjpeg_active_count + g_rtsp_active_count;
+}
+
+/* Sessions that hold the camera, as opposed to clients that are merely
+ * connected: an RTSP client between connect and PLAY, or one that only
+ * pulls audio, is not waiting for frames and must not trip the stall
+ * watchdog. */
+__xip_text
+uint32_t xf16cam_media_capturing(void)
+{
+	return g_camera_users;
+}
+
 static XF16CamMediaInfo g_media_info = {
 	.jpeg_capacity = JPEG_BUFF_SIZE,
 };
@@ -236,6 +266,9 @@ static int xf16cam_camera_manager_init(void)
 	if (OS_MutexCreate(&g_camera_lock) != OS_OK)
 		return -1;
 	g_camera_lock_ready = 1;
+	if (OS_MutexCreate(&g_capture_lock) != OS_OK)
+		return -1;
+	g_capture_lock_ready = 1;
 	if (xf16_board_camera_power_prepare() != 0)
 		return -1;
 	if (camera_init() != 0) {
@@ -266,6 +299,11 @@ static int xf16cam_camera_acquire(void)
 		g_camera_initialized = 1;
 	}
 	++g_camera_users;
+	/* Restart the stall clock. last_frame_ms otherwise still holds the
+	 * previous session's final frame, and a client arriving 30 s after
+	 * that was rebooted on the first board poll, before the cold sensor
+	 * re-init above could produce anything. */
+	g_media_info.last_frame_ms = OS_TicksToMSecs(OS_GetTicks());
 	result = 0;
 out:
 	OS_MutexUnlock(&g_camera_lock);
@@ -436,6 +474,7 @@ static int xf16cam_capture_jpeg(CAMERA_JpegBuffInfo *info, uint8_t **jpeg,
 	*jpeg = mem_mgmt.jpeg_buf[info->buff_index].addr - CAMERA_JPEG_HEADER_LEN;
 	*jpeg_len = info->size + CAMERA_JPEG_HEADER_LEN;
 	++g_media_info.frames;
+	g_media_info.last_frame_ms = OS_TicksToMSecs(OS_GetTicks());
 	if (info->size > g_media_info.largest_jpeg)
 		g_media_info.largest_jpeg = info->size;
 	return 0;
@@ -465,22 +504,30 @@ static int xf16cam_mjpeg_stream(int fd)
 		uint32_t eoi_len;
 		int capture;
 		int length;
+		int failed;
 
-		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
-		if (capture < 0)
+		if (!g_capture_lock_ready ||
+		    OS_MutexLock(&g_capture_lock, OS_WAIT_FOREVER) != OS_OK)
 			break;
-		if (capture > 0)
+		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+		if (capture != 0) {
+			OS_MutexUnlock(&g_capture_lock);
+			if (capture < 0)
+				break;
 			continue;
+		}
 		eoi_len = jpeg_len >= 2 && jpeg[jpeg_len - 2] == 0xff &&
 		          jpeg[jpeg_len - 1] == 0xd9 ? 0 : sizeof(eoi);
-		length = snprintf(part, sizeof(part),
-		                  "--xf16frame\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
-		                  (unsigned long)(jpeg_len + eoi_len));
-		if (length <= 0 || length >= (int)sizeof(part) ||
-		    xf16cam_send_all(fd, part, length) != 0 ||
-		    xf16cam_send_all(fd, jpeg, jpeg_len) != 0 ||
-		    (eoi_len != 0 && xf16cam_send_all(fd, eoi, eoi_len) != 0) ||
-		    xf16cam_send_all(fd, "\r\n", 2) != 0)
+		length = XF16CAM_XIP_FORMAT(part, sizeof(part),
+		                            "--xf16frame\r\nContent-Type: image/jpeg\r\nContent-Length: %lu\r\n\r\n",
+		                            (unsigned long)(jpeg_len + eoi_len));
+		failed = length <= 0 || length >= (int)sizeof(part) ||
+		         xf16cam_send_all(fd, part, length) != 0 ||
+		         xf16cam_send_all(fd, jpeg, jpeg_len) != 0 ||
+		         (eoi_len != 0 && xf16cam_send_all(fd, eoi, eoi_len) != 0) ||
+		         xf16cam_send_all(fd, "\r\n", 2) != 0;
+		OS_MutexUnlock(&g_capture_lock);
+		if (failed)
 			break;
 	}
 	printf("xf16cam WEB client stopped\n");
@@ -489,15 +536,28 @@ static int xf16cam_mjpeg_stream(int fd)
 
 static void xf16cam_mjpeg_task(void *arg)
 {
-	int fd = (int)(intptr_t)arg;
+	uint32_t slot = (uint32_t)(uintptr_t)arg;
+	int fd = g_mjpeg_clients[slot].fd;
 
 	xf16cam_mjpeg_stream(fd);
 	closesocket(fd);
 	xf16cam_camera_release();
-	OS_ThreadSetInvalid(&g_mjpeg_thread);
+	OS_ThreadSetInvalid(&g_mjpeg_clients[slot].thread);
 	__sync_synchronize();
-	g_mjpeg_active = 0;
+	g_mjpeg_clients[slot].active = 0;
+	if (g_mjpeg_active_count > 0)
+		__sync_fetch_and_sub(&g_mjpeg_active_count, 1);
 	OS_ThreadDelete(NULL);
+}
+
+int xf16cam_find_mjpeg_slot(void)
+{
+	for (int slot = 0; slot < XF16CAM_MAX_PARALLEL_CLIENTS; ++slot) {
+		if (__sync_bool_compare_and_swap(&g_mjpeg_clients[slot].active, 0, 1)) {
+			return slot;
+		}
+	}
+	return -1;
 }
 
 __xip_text
@@ -507,19 +567,26 @@ int xf16cam_mjpeg_start(int fd)
 
 	if (xf16cam_update_active())
 		return -1;
-	if (g_mjpeg_active)
+	int slot = xf16cam_find_mjpeg_slot();
+	if (slot < 0)
 		return -1;
 	if (xf16cam_camera_acquire() != 0)
-		return -1;
+		goto fail_slot;
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-	g_mjpeg_active = 1;
-	if (OS_ThreadCreate(&g_mjpeg_thread, "xf16cam-mjpeg", xf16cam_mjpeg_task,
-	                    (void *)(intptr_t)fd, OS_THREAD_PRIO_APP, 2 * 1024) != OS_OK) {
-		g_mjpeg_active = 0;
+	g_mjpeg_clients[slot].fd = fd;
+	__sync_fetch_and_add(&g_mjpeg_active_count, 1);
+	if (OS_ThreadCreate(&g_mjpeg_clients[slot].thread, "xf16cam-mjpeg", xf16cam_mjpeg_task,
+	                    (void *)(uintptr_t)slot, OS_THREAD_PRIO_APP, 3 * 1024) != OS_OK) {
+		__sync_fetch_and_sub(&g_mjpeg_active_count, 1);
 		xf16cam_camera_release();
-		return -1;
+		goto fail_slot;
 	}
 	return 0;
+
+fail_slot:
+	__sync_synchronize();
+	g_mjpeg_clients[slot].active = 0;
+	return -1;
 }
 
 typedef struct {
@@ -711,24 +778,24 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 	int n;
 
 	if (!strncmp(request, "OPTIONS ", 8)) {
-		n = snprintf(response, sizeof(response),
-			     "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
-			     cseq);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
+			               cseq);
 	} else if (!strncmp(request, "DESCRIBE ", 9)) {
-		int sdp_len = snprintf(sdp, sizeof(sdp),
+		int sdp_len = XF16CAM_XIP_FORMAT(sdp, sizeof(sdp),
 			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=XF16 %s\r\nc=IN IP4 %s\r\nt=0 0\r\n"
 			"m=video 0 RTP/AVP 26\r\na=rtpmap:26 JPEG/90000\r\na=control:track1\r\n"
 			"%s",
 			ip, xf16cam_sensor_name(), ip,
 			session->audio_available ?
 			"m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:track2\r\n" : "");
-		n = snprintf(response, sizeof(response),
-			     "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Base: rtsp://%s:%u/stream/\r\n"
-			     "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-			     cseq, ip, XF16CAM_RTSP_PORT, sdp_len, sdp);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Base: rtsp://%s:%u/stream/\r\n"
+			               "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
+			               cseq, ip, XF16CAM_RTSP_PORT, sdp_len, sdp);
 	} else if (!strncmp(request, "SETUP ", 6) && !xf16cam_rtsp_tcp_transport(request)) {
-		n = snprintf(response, sizeof(response),
-		             "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %d\r\n\r\n", cseq);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+		                       "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %d\r\n\r\n", cseq);
 	} else if (!strncmp(request, "SETUP ", 6)) {
 		int video = strstr(request, "track1") != NULL;
 		int audio = strstr(request, "track2") != NULL;
@@ -740,13 +807,13 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 		     xf16cam_rtsp_channels_overlap(requested_channel, session->video_channel)) ||
 		    (video && session->audio_setup &&
 		     xf16cam_rtsp_channels_overlap(requested_channel, session->audio_channel))) {
-			n = snprintf(response, sizeof(response),
-			             "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", cseq);
+			n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			                       "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", cseq);
 		} else {
 			if (audio && !session->audio_acquired && xf16cam_audio_acquire() != 0) {
-				n = snprintf(response, sizeof(response),
-				             "RTSP/1.0 503 Service Unavailable\r\nCSeq: %d\r\n\r\n",
-				             cseq);
+				n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+				                       "RTSP/1.0 503 Service Unavailable\r\nCSeq: %d\r\n\r\n",
+				                       cseq);
 			} else {
 				*channel = requested_channel;
 				if (audio) {
@@ -755,46 +822,46 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 				} else {
 					session->video_setup = 1;
 				}
-				n = snprintf(response, sizeof(response),
-				             "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n"
-				             "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n\r\n",
-				             cseq, (unsigned int)*channel,
-				             (unsigned int)*channel + 1U);
+				n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+				                       "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n"
+				                       "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n\r\n",
+				                       cseq, (unsigned int)*channel,
+				                       (unsigned int)*channel + 1U);
 			}
 		}
 	} else if (!strncmp(request, "PLAY ", 5)) {
 		if (!session->video_setup) {
-			n = snprintf(response, sizeof(response),
-			             "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n",
-			             cseq);
+			n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			                       "RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: %d\r\n\r\n",
+			                       cseq);
 		} else if (session->audio_setup) {
-			n = snprintf(response, sizeof(response),
-			             "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\nRange: npt=0.000-\r\n"
-			             "RTP-Info: url=rtsp://%s:%u/stream/track1;seq=%u;rtptime=%lu,"
-			             "url=rtsp://%s:%u/stream/track2;seq=%u;rtptime=%lu\r\n\r\n",
-			             cseq, ip, XF16CAM_RTSP_PORT, video_sequence, (unsigned long)video_timestamp,
-			             ip, XF16CAM_RTSP_PORT, audio_sequence, (unsigned long)audio_timestamp);
+			n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			                       "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\nRange: npt=0.000-\r\n"
+			                       "RTP-Info: url=rtsp://%s:%u/stream/track1;seq=%u;rtptime=%lu,"
+			                       "url=rtsp://%s:%u/stream/track2;seq=%u;rtptime=%lu\r\n\r\n",
+			                       cseq, ip, XF16CAM_RTSP_PORT, video_sequence, (unsigned long)video_timestamp,
+			                       ip, XF16CAM_RTSP_PORT, audio_sequence, (unsigned long)audio_timestamp);
 		} else {
-			n = snprintf(response, sizeof(response),
-			             "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\nRange: npt=0.000-\r\n"
-			             "RTP-Info: url=rtsp://%s:%u/stream/track1;seq=%u;rtptime=%lu\r\n\r\n",
-			             cseq, ip, XF16CAM_RTSP_PORT, video_sequence,
-			             (unsigned long)video_timestamp);
+			n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			                       "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\nRange: npt=0.000-\r\n"
+			                       "RTP-Info: url=rtsp://%s:%u/stream/track1;seq=%u;rtptime=%lu\r\n\r\n",
+			                       cseq, ip, XF16CAM_RTSP_PORT, video_sequence,
+			                       (unsigned long)video_timestamp);
 		}
 	} else if (!strncmp(request, "TEARDOWN ", 9)) {
-		n = snprintf(response, sizeof(response),
-			     "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n\r\n", cseq);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n\r\n", cseq);
 		if (n > 0)
 			xf16cam_send_all(fd, response, (uint32_t)n);
 		return 2;
 	} else if (!strncmp(request, "GET_PARAMETER ", 14)) {
-		n = snprintf(response, sizeof(response),
-			     "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n\r\n", cseq);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nSession: 58463136\r\n\r\n", cseq);
 	} else {
-		n = snprintf(response, sizeof(response),
-		             "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n"
-		             "Allow: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
-		             cseq);
+		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
+		                       "RTSP/1.0 405 Method Not Allowed\r\nCSeq: %d\r\n"
+		                       "Allow: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
+		                       cseq);
 	}
 	if (n <= 0 || n >= (int)sizeof(response) ||
 	    xf16cam_send_all(fd, response, (uint32_t)n) != 0)
@@ -909,23 +976,34 @@ static int xf16cam_stream_client(int fd, const char *ip)
 				goto stopped;
 		}
 
-		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
-		if (capture < 0)
+		if (!g_capture_lock_ready ||
+		    OS_MutexLock(&g_capture_lock, OS_WAIT_FOREVER) != OS_OK)
 			break;
-		if (capture > 0)
+		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+		if (capture != 0) {
+			OS_MutexUnlock(&g_capture_lock);
+			if (capture < 0)
+				break;
 			continue;
+		}
 		if (xf16cam_parse_jpeg(jpeg, jpeg_len, &jpg) != 0) {
+			OS_MutexUnlock(&g_capture_lock);
 			printf("xf16cam invalid jpeg: index=%u len=%lu\n",
 			       info.buff_index, (unsigned long)jpeg_len);
 			continue;
 		}
 		if (session.audio_setup &&
 		    xf16cam_send_rtp_audio(fd, &audio_sequence, &audio_cursor,
-		                             session.audio_channel) != 0)
+		                             session.audio_channel) != 0) {
+			OS_MutexUnlock(&g_capture_lock);
 			break;
+		}
 		if (xf16cam_send_rtp_jpeg(fd, &jpg, &sequence, timestamp,
-		                            session.video_channel) != 0)
+		                            session.video_channel) != 0) {
+			OS_MutexUnlock(&g_capture_lock);
 			break;
+		}
+		OS_MutexUnlock(&g_capture_lock);
 		timestamp = OS_TicksToMSecs(OS_GetTicks()) * 90U;
 		if (session.audio_setup &&
 		    xf16cam_send_rtp_audio(fd, &audio_sequence, &audio_cursor,
@@ -958,33 +1036,71 @@ static int xf16cam_rtsp_listener_open(void)
 	addr.sin_port = htons(XF16CAM_RTSP_PORT);
 	addr.sin_addr.s_addr = INADDR_ANY;
 	if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-	    listen(server, 1) != 0) {
+	    listen(server, XF16CAM_MAX_PARALLEL_CLIENTS) != 0) {
 		closesocket(server);
 		return -1;
 	}
 	return server;
 }
 
+static void xf16cam_rtsp_client_task(void *arg)
+{
+	char ip[16];
+	uint32_t slot = (uint32_t)(uintptr_t)arg;
+	int fd = g_rtsp_clients[slot].fd;
+
+	XF16CAM_XIP_FORMAT(ip, sizeof(ip), "%s", xf16cam_net_ip());
+	xf16cam_stream_client(fd, ip);
+	closesocket(fd);
+	OS_ThreadSetInvalid(&g_rtsp_clients[slot].thread);
+	__sync_synchronize();
+	g_rtsp_clients[slot].active = 0;
+	if (g_rtsp_active_count > 0)
+		__sync_fetch_and_sub(&g_rtsp_active_count, 1);
+	OS_ThreadDelete(NULL);
+}
+
+static int xf16cam_find_rtsp_slot(void)
+{
+	for (int slot = 0; slot < XF16CAM_MAX_PARALLEL_CLIENTS; ++slot) {
+		if (__sync_bool_compare_and_swap(&g_rtsp_clients[slot].active, 0, 1)) {
+			return slot;
+		}
+	}
+	return -1;
+}
+
 static void xf16cam_rtsp_server(int server)
 {
 	char ip[16];
 
-	snprintf(ip, sizeof(ip), "%s", xf16cam_net_ip());
+	XF16CAM_XIP_FORMAT(ip, sizeof(ip), "%s", xf16cam_net_ip());
 	printf("xf16cam ready: rtsp://%s:%u/stream\n", ip, XF16CAM_RTSP_PORT);
 	while (1) {
 		int client = accept(server, NULL, NULL);
+
 		if (client < 0)
 			continue;
-		g_rtsp_active = 1;
 		if (xf16cam_update_active()) {
 			closesocket(client);
-			g_rtsp_active = 0;
 			continue;
 		}
+		int slot = xf16cam_find_rtsp_slot();
+		if (slot < 0) {
+			closesocket(client);
+			continue;
+		}
+		g_rtsp_clients[slot].fd = client;
+		__sync_fetch_and_add(&g_rtsp_active_count, 1);
 		printf("xf16cam RTSP client connected\n");
-		xf16cam_stream_client(client, ip);
-		closesocket(client);
-		g_rtsp_active = 0;
+		if (OS_ThreadCreate(&g_rtsp_clients[slot].thread, "xf16cam-rtsp-client",
+		                    xf16cam_rtsp_client_task, (void *)(uintptr_t)slot,
+		                    OS_THREAD_PRIO_APP, XF16CAM_RTSP_CLIENT_STACK) != OS_OK) {
+			__sync_fetch_and_sub(&g_rtsp_active_count, 1);
+			__sync_synchronize();
+			g_rtsp_clients[slot].active = 0;
+			closesocket(client);
+		}
 	}
 }
 
@@ -994,7 +1110,8 @@ int xf16cam_media_quiesce_for_update(uint32_t timeout_ms)
 	uint32_t start = OS_TicksToMSecs(OS_GetTicks());
 
 	while (OS_TicksToMSecs(OS_GetTicks()) - start < timeout_ms) {
-		if (!g_mjpeg_active && !g_rtsp_active && xf16cam_audio_update_ready())
+		if (g_mjpeg_active_count == 0 && g_rtsp_active_count == 0 &&
+		    xf16cam_audio_update_ready())
 			return 0;
 		OS_MSleep(10);
 	}
@@ -1009,11 +1126,13 @@ static void __attribute__((noreturn)) xf16cam_idle(void)
 
 int main(void)
 {
+	xf16cam_board_check_previous_crash();
 	int board_ready;
 	int camera_ready;
 	int rtsp_server = -1;
 
 	platform_init();
+	xf16cam_log_init();	/* console mirror, if XF16CAM_NETLOG */
 	printf("xf16cam version %s\n", XF16CAM_VERSION);
 	if (xf16cam_rail_init() != 0)
 		printf("xf16cam media rail: initialization failed\n");

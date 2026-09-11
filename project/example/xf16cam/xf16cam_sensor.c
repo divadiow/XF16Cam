@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "compiler.h"
 #include "driver/chip/hal_gpio.h"
@@ -604,6 +605,7 @@ static const uint8_t sp0a39_day_mode[] = {
     0xFD, 0x00,   // return to page 0
 };
 
+__xip_text
 void xf16cam_sensor_switch_cam_sensor_mode(int night_mode)
 {
 	I2C_ID bus = I2C0_ID;

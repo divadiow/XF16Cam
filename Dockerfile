@@ -25,7 +25,7 @@ RUN mkdir -p /opt/arm-gnu-toolchain \
 ENV PATH="/opt/arm-gnu-toolchain/bin:${PATH}"
 
 WORKDIR /workspace
-COPY . .
+COPY --exclude=./dist --exclude=./.git . .
 
 # Test RTSP request parser
 RUN cc -std=c11 -Wall -Wextra -Werror \
@@ -41,12 +41,20 @@ RUN printf '%s\n' \
     '__CONFIG_HOSC_TYPE ?= 40' > .config \
     && chmod +x tools/mkimage
 
+# Apply os_thread.c.patch
+RUN patch -p1 < patches/os_thread.c.patch
+
 # Build flash and OTA images. Pass BUILD_VARIANT=no_ptz for the fixed-camera
-# board; the default PTZ build leaves NO_PTZ undefined.
-RUN case "$BUILD_VARIANT" in \
-    ptz) symbols= ;; \
-    no_ptz) symbols=-DNO_PTZ ;; \
-    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz)" >&2; exit 1 ;; \
+# board; the default PTZ build leaves NO_PTZ undefined. A _netlog suffix adds
+# XF16CAM_NETLOG, the UDP console mirror (see xf16cam_log.c).
+RUN variant="$BUILD_VARIANT"; symbols=""; \
+    case "$variant" in \
+    *_netlog) symbols="-DXF16CAM_NETLOG"; variant="${variant%_netlog}" ;; \
+    esac; \
+    case "$variant" in \
+    ptz) ;; \
+    no_ptz) symbols="$symbols -DNO_PTZ" ;; \
+    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz, optionally with _netlog)" >&2; exit 1 ;; \
     esac \
     && make -C project/example/xf16cam/gcc \
     CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
@@ -55,12 +63,19 @@ RUN case "$BUILD_VARIANT" in \
     CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
     PRJ_EXTRA_SYMBOLS="$symbols" image_xz
 
-# Check critical code placement
+# Check critical code placement. The absent sentinels catch an SDK update
+# silently linking lwIP DNS/IGMP back in (see xf16cam_lwip_stubs.c). PM must
+# stay compiled in on both variants: hal_flashctrl.c keys its SBUS re-init
+# workaround (FLASHC_TEMP_FIXED) to CONFIG_PM, and without it the first flash
+# write -- an OTA piece or a settings save -- hangs the device.
 RUN python3 tools/xf16cam/check_symbol_placement.py \
     --elf project/example/xf16cam/gcc/xf16cam.axf \
     --require-sram xf16cam_http_flash_info \
     --require-sram xf16cam_http_ota \
-    --require-xip xf16cam_http_start
+    --require-sram flashc_suspend \
+    --require-xip xf16cam_http_start \
+    --require-absent dns_table \
+    --require-absent igmp_group_list
 
 # Check 1 MiB flash budget
 RUN mkdir -p dist \
