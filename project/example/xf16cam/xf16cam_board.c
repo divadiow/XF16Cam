@@ -7,6 +7,8 @@
 #include "driver/chip/hal_gpio.h"
 #include "driver/chip/hal_prcm.h"
 #include "driver/chip/hal_wdg.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include "xf16cam_board.h"
 #include "xf16cam_config.h"
@@ -303,6 +305,9 @@ int xf16cam_board_init(void)
 		printf("xf16cam board thread create failed\n");
 		return -1;
 	}
+	init_hardware_watchdog();
+	xTaskCreate(vWatchdogTask, "WDG_Task", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+
 	return 0;
 }
 
@@ -362,3 +367,37 @@ uint32_t xf16cam_board_stack_min_free(void)
 	return OS_ThreadGetStackMinFreeSize(&g_board_thread);
 }
 
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+  printf("Stack overflow in task %s\n", pcTaskName);
+  // Disable interrupts to prevent further damage
+  __disable_irq(); // Disable interrupts to prevent further damage
+  // Reboot the system to recover from stack overflow
+  HAL_WDG_Reboot(); // Reboot the system to recover from stack overflow
+  while (1) {
+    __NOP(); // Do nothing, just wait for the system to reboot
+  } // Wait for the system to reboot
+}
+
+#include "driver/chip/hal_wdg.h"
+
+void init_hardware_watchdog(void)
+{
+    WDG_InitParam param;
+
+    param.hw.event = WDG_EVT_RESET;
+    param.hw.timeout = WDG_TIMEOUT_10SEC;
+	param.hw.resetCycle = WDG_DEFAULT_RESET_CYCLE;
+
+    HAL_WDG_Init(&param);
+    HAL_WDG_Start();
+}
+
+void vWatchdogTask(void *pvParameters)
+{
+    (void)pvParameters;
+
+    while (1) {
+        HAL_WDG_Feed();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
