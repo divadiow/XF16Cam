@@ -19,12 +19,15 @@
 #include "common/framework/sysinfo.h"
 
 #include "xf16cam_config.h"
+#include "xf16cam_light.h"
 #include "xf16cam_audio.h"
+#include "xf16cam_motion.h"
 #include "xf16cam_board.h"
 #include "xf16cam_http.h"
 #include "xf16cam_media.h"
 #include "xf16cam_net.h"
 #include "xf16cam_power.h"
+#include "xf16cam_ptz.h"
 #include "xf16cam_sensor.h"
 #include "xf16cam_storage.h"
 #include "xf16cam_version.h"
@@ -152,7 +155,7 @@ __xip_rodata static const char g_page_head[] =
 	"grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.card{padding:16px}.wide{grid-column:1/-1}.grid{display:grid;"
 	"grid-template-columns:max-content 1fr;gap:7px 14px}.grid b{color:#43515e}form{margin:8px 0}label{display:block;margin:8px 0}"
 	"input,button{font:inherit;min-height:44px;padding:9px 11px;margin:4px 0;border:1px solid #b9c5cd;border-radius:7px}input{width:100%;background:#fff;font-size:16px}"
-	"button{background:#f7f9fa}button.primary{background:var(--brand);border-color:var(--brand);color:#fff}"
+	"button{background:#f7f9fa;cursor:pointer}button:disabled{cursor:not-allowed}button.primary{background:var(--brand);border-color:var(--brand);color:#fff}"
 	"small{color:var(--muted)}a{color:#096b99}.rtsp{overflow-wrap:anywhere}.nets{display:grid;gap:7px;margin:10px 0}.net{width:100%;display:flex;gap:10px;"
 	"align-items:center;justify-content:space-between;text-align:left;margin:0;background:#fff}.net span:first-child{min-width:0;overflow-wrap:anywhere}.net span:last-child{flex:none;white-space:nowrap}.net.sel{border-color:var(--brand);"
 	"box-shadow:0 0 0 2px #176b5b33;background:#f3faf8}.net.empty{justify-content:center;color:var(--muted)}@media(max-width:680px){header{align-items:flex-start}.panel.on{grid-template-columns:1fr}"
@@ -352,7 +355,9 @@ static void xf16cam_http_page(int fd)
 	                  "<nav class=tabs><button type=button data-tab=live onclick=tab('live')>Live</button>"
 	                  "<button type=button data-tab=network onclick=tab('network')>Network</button>"
 	                  "<button type=button data-tab=storage onclick=tab('storage')>Storage</button>"
-	                  "<button type=button data-tab=system onclick=tab('system')>System</button></nav>"
+	                  "<button type=button data-tab=system onclick=tab('system')>System</button> "
+	                  "<button type=button data-tab=light onclick=tab('light')>Light</button> "
+		                  "<button type=button data-tab=position onclick=tab('position')>Position</button></nav>"
 	                  "<div id=live class=panel><section class=card><h2>Camera</h2><div class=grid>"
 	                  "<b>Sensor</b><span>");
 	xf16cam_http_send_text(fd, xf16cam_sensor_name());
@@ -387,6 +392,98 @@ static void xf16cam_http_page(int fd)
 	                  !audio->available ? "AMIC unavailable" :
 	                  audio->active ? "AMIC active, PCMU/8000" : "AMIC ready (on demand)", audio->peak);
 	xf16cam_http_send_all(fd, dynamic, length);
+
+
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=light class=panel><section class='card wide'><h2>Light</h2>"
+	                  "<div class=grid><b>Light</b><span><span id=lightStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "Enabled (PB20 HIGH)" : "Disabled (PB20 LOW)");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>Light intensity</b><span><span id=intensityStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "Stronger (PB3 OUTPUT LOW)" : "Weaker (PB3 INPUT)");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>Automatic day/night</b><span><span id=dayNightStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_AUTO_DAY_NIGHT(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>IR LED</b><span><span id=irStatus>");
+	xf16cam_http_send_text(fd, xf16cam_board_ir_led_on() ? "On (PA22)" : "Off (PA22)");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</span></span><b>Motion detection</b><span id=motionStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_MOTION_ENABLED(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Sound alarm</b><span id=motionAlarmStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_MOTION_ALARM_ENABLED(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Motion events</b><span id=motionEvents>");
+	length = snprintf(dynamic, sizeof(dynamic), "%lu",
+	                  (unsigned long)xf16cam_board_motion_events());
+	xf16cam_http_send_all(fd, dynamic, length);
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Last motion</b><span id=motionLast>");
+	if (xf16cam_board_motion_active())
+		XF16CAM_HTTP_SEND_LITERAL(fd, "Motion detected");
+	else if (xf16cam_board_motion_age_ms() == 0xffffffffUL)
+		XF16CAM_HTTP_SEND_LITERAL(fd, "No events");
+	else {
+		length = snprintf(dynamic, sizeof(dynamic), "%lu s ago",
+		                  (unsigned long)(xf16cam_board_motion_age_ms() / 1000U));
+		xf16cam_http_send_all(fd, dynamic, length);
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</span></span></div><form method=post action=/api/light>"
+	                  "<button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "0" : "1");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=light value=disabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || !XF16CAM_LIGHT_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Disabled</button> <button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "1" : "0");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=light value=enabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || XF16CAM_LIGHT_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Enabled</button></form><form method=post action=/api/light>"
+	                  "<button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "0" : "1");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=intensity value=weaker");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || !XF16CAM_LIGHT_STRONGER(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Weaker</button> <button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "1" : "0");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=intensity value=stronger");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || XF16CAM_LIGHT_STRONGER(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Stronger</button></form><form method=post action=/api/light>"
+	                  "<button type=submit onclick='lightSubmit(this);return false' name=daynight value=disabled");
+	if (!XF16CAM_AUTO_DAY_NIGHT(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Auto day/night off</button> "
+	                  "<button type=submit onclick='lightSubmit(this);return false' name=daynight value=enabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Auto day/night on</button></form>"
+	                  "<small>Automatic mode disables manual light controls and switches the IR-cut filter / IR LED using the light sensor.</small>"
+	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=motion value=disabled");
+	if (!XF16CAM_MOTION_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion off</button> <button onclick='motionSubmit(this);return false' name=motion value=enabled");
+	if (XF16CAM_MOTION_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion on</button></form>"
+	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=alarm value=disabled");
+	if (!XF16CAM_MOTION_ALARM_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm off</button> <button onclick='motionSubmit(this);return false' name=alarm value=enabled");
+	if (XF16CAM_MOTION_ALARM_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm on</button></form>"
+	                  "<small>Motion turns on the white fill light for 30 seconds when movement is detected at night. The sound alarm works independently of Motion.</small>"
+	                  "<span id=motionResult aria-live=polite></span>"
+	                  "<span id=lightResult aria-live=polite></span></section></div>");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=position class=panel><section class='card wide'><h2>Position</h2>"
+	                  
+	                  "<div style='display:grid;grid-template-columns:repeat(3,64px);gap:6px;width:max-content;margin:12px auto'>"
+	                  "<span></span><button type=button value=up style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▲</button><span></span>"
+	                  "<button type=button value=left style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>◀</button>"
+	                  "<span style='display:grid;place-items:center'>PTZ</span>"
+	                  "<button type=button value=right style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▶</button>"
+	                  "<span></span><button type=button value=down style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▼</button><span></span>"
+	                  "</div><span id=positionResult aria-live=polite>Ready</span></section></div>");
+
 
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<div id=network class=panel><section class='card wide'><h2>Wi-Fi setup</h2>"
@@ -483,7 +580,47 @@ static void xf16cam_http_page(int fd)
 	                  "function videoRetry(){clearTimeout(vt);if(!vh&&!D.hidden)vt=setTimeout(videoStart,1500)}"
 	                  "function tab(id){A('.panel').forEach(e=>e.classList.toggle('on',e.id==id));"
 	                  "A('.tabs button').forEach(e=>{let on=e.dataset.tab==id;e.classList.toggle('on',on);e.setAttribute('aria-selected',on)})}"
-	                  "function clearNet(){A('.net').forEach(e=>e.classList.remove('sel'))}"
+	                  "function lightSubmit(b){let f=b.form,s=$('#lightResult'),k=b.name,v=b.value;"
+	                  "if(!f||b.disabled)return false;b.disabled=true;s.textContent='Saving...';"
+	                  "fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+	                  "body:encodeURIComponent(k)+'='+encodeURIComponent(v)})"
+	                  ".then(r=>{if(!r.ok)throw 0;return r.text()})"
+	                  ".then(()=>{if(k==='light')$('#lightStatus').textContent=v==='enabled'?'Enabled (PB20 HIGH)':'Disabled (PB20 LOW)';"
+	                  "else if(k==='intensity')$('#intensityStatus').textContent=v==='stronger'?'Stronger (PB3 OUTPUT LOW)':'Weaker (PB3 INPUT)';"
+	                  "else $('#dayNightStatus').textContent=v==='enabled'?'Enabled':'Disabled';"
+	                  "if(k==='light'||k==='intensity')f.querySelectorAll('button').forEach(x=>{let a=x.value===v;x.dataset.active=a?'1':'0';"
+	                  "x.disabled=a||$('#dayNightStatus').textContent==='Enabled'});"
+	                  "else{f.querySelectorAll('button').forEach(x=>x.disabled=x.value===v);"
+	                  "A('.manual-light').forEach(x=>x.disabled=v==='enabled'||x.dataset.active==='1')}"
+	                  "s.textContent='Saved'})"
+	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
+	                  "function motionSubmit(b){let f=b.form,s=$('#motionResult'),k=b.name,v=b.value;"
+	                  "if(!f||b.disabled)return false;b.disabled=true;s.textContent='Saving...';"
+	                  "fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+	                  "body:encodeURIComponent(k)+'='+encodeURIComponent(v)})"
+	                  ".then(r=>{if(!r.ok)throw 0;return r.text()})"
+	                  ".then(()=>{f.querySelectorAll('button').forEach(x=>x.disabled=x.value===v);s.textContent='Saved'})"
+	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
+	                  "let ptzPressTimer=0,ptzHolding=false,ptzMode='',ptzStartPromise=null;"
+                  "async function ptzSend(mode,action){let d=new URLSearchParams();d.set('mode',mode);d.set('action',action);"
+                  "let r=await fetch('/api/ptz',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d.toString()});"
+                  "if(!r.ok)throw 0;return r.text()}"
+                  "function ptzPress(e,b){if(ptzHolding||ptzPressTimer)return;"
+                  "if(e.pointerType==='mouse'&&e.button!==0)return;e.preventDefault();ptzMode=b.value;"
+                  "try{b.setPointerCapture(e.pointerId)}catch(x){}ptzPressTimer=setTimeout(()=>{ptzPressTimer=0;"
+                  "ptzHolding=true;$('#positionResult').textContent='Moving...';"
+                  "ptzStartPromise=ptzSend(ptzMode,'start');ptzStartPromise.catch(()=>{ptzHolding=false;$('#positionResult').textContent='Movement failed'})},250)}"
+                  "function ptzRelease(e){if(ptzPressTimer&&!ptzHolding){clearTimeout(ptzPressTimer);ptzPressTimer=0;"
+                  "let m=ptzMode;$('#positionResult').textContent='Moving...';"
+                  "ptzSend(m,'step').then(()=>$('#positionResult').textContent='Movement complete')"
+                  ".catch(()=>$('#positionResult').textContent='Movement failed');return}"
+                  "if(ptzHolding){ptzHolding=false;Promise.resolve(ptzStartPromise).then(()=>ptzSend(ptzMode,'stop')).then(()=>$('#positionResult').textContent='Stopped')"
+                  ".catch(()=>$('#positionResult').textContent='Stop failed')}}"
+                  "function ptzCancel(e){if(ptzPressTimer)clearTimeout(ptzPressTimer);ptzPressTimer=0;"
+                  "if(ptzHolding){ptzHolding=false;Promise.resolve(ptzStartPromise).then(()=>ptzSend(ptzMode,'stop')).catch(()=>{});$('#positionResult').textContent='Stopped'}}"
+                  "D.addEventListener('visibilitychange',()=>{if(D.hidden)ptzCancel()});"
+                  "D.addEventListener('blur',ptzCancel);"
+                  "function clearNet(){A('.net').forEach(e=>e.classList.remove('sel'))}"
 	                  "function pickNet(b){$('#ssid').value=b.dataset.ssid;clearNet();b.classList.add('sel');"
 	                  "$('input[name=password]').focus()}"
 	                  "async function scan(){let s=$('#scan'),b=$('#scanButton'),d=$('#networks');"
@@ -501,9 +638,13 @@ static void xf16cam_http_page(int fd)
 	                  "ok=r.ok;s.textContent=ok?t:'Update failed (HTTP '+r.status+')'}catch(e){s.textContent='Connection closed; check for reboot'}finally{b.disabled=false;if(!ok){vh=0;videoStart()}}}"
 	                  "async function meter(){if(!D.hidden&&$('#live').classList.contains('on'))try{"
 	                  "let a=await(await fetch('/api/audio')).json(),m=$('#mic');if(m)m.textContent=a.peak}catch(e){}setTimeout(meter,2000)}"
+	                  "async function motionPoll(){if(!D.hidden)try{let m=await(await fetch('/api/motion')).json();"
+	                  "$('#motionStatus').textContent=m.enabled?'Enabled':'Disabled';$('#motionAlarmStatus').textContent=m.alarm?'Enabled':'Disabled';"
+	                  "$('#motionEvents').textContent=m.events;$('#motionLast').textContent=m.active?'Motion detected':"
+	                  "m.age_ms===4294967295?'No events':Math.floor(m.age_ms/1000)+' s ago'}catch(e){}setTimeout(motionPoll,2000)}"
 	                  "let v=$('#video');if(v){v.onerror=videoRetry;videoStart()}"
 	                  "D.addEventListener('visibilitychange',()=>D.hidden?videoStop():videoStart());"
-	                  "tab('live');meter()</script></main></body></html>");
+	                  "tab('live');meter();motionPoll()</script></main></body></html>");
 }
 
 __xip_text
@@ -784,7 +925,7 @@ static int xf16cam_http_handle(int fd)
 	uint32_t request_start = OS_TicksToMSecs(OS_GetTicks());
 	char ssid[XF16CAM_SSID_MAX_LEN + 1];
 	char psk[XF16CAM_PSK_MAX_LEN + 1];
-	char mode[8];
+	char mode[16];
 
 	memset(g_request, 0, sizeof(g_request));
 	header_end = NULL;
@@ -856,6 +997,18 @@ static int xf16cam_http_handle(int fd)
 		xf16cam_http_scan_json(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/audio") == 0) {
 		xf16cam_http_audio_json(fd);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/motion") == 0) {
+		const XF16CamConfig *config = xf16cam_config_get();
+		char response[192];
+		int length = snprintf(response, sizeof(response),
+		                      "{\"enabled\":%s,\"alarm\":%s,\"events\":%lu,\"active\":%s,\"age_ms\":%lu}",
+		                      XF16CAM_MOTION_ENABLED(config) ? "true" : "false",
+		                      XF16CAM_MOTION_ALARM_ENABLED(config) ? "true" : "false",
+		                      (unsigned long)xf16cam_board_motion_events(),
+		                      xf16cam_board_motion_active() ? "true" : "false",
+		                      (unsigned long)xf16cam_board_motion_age_ms());
+		xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
+		xf16cam_http_send_all(fd, response, length);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
 		xf16cam_http_power_json(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifi") == 0) {
@@ -897,16 +1050,157 @@ static int xf16cam_http_handle(int fd)
 		}
 		xf16cam_http_message(fd, "200 OK", "Open AP restored. Rebooting...");
 		return XF16CAM_HTTP_COLD_REBOOT;
+
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/light") == 0) {
+		uint8_t enabled = XF16CAM_LIGHT_ENABLED(xf16cam_config_get()) ? 1U : 0U;
+		uint8_t stronger = XF16CAM_LIGHT_STRONGER(xf16cam_config_get()) ? 1U : 0U;
+		uint8_t daynight = XF16CAM_AUTO_DAY_NIGHT(xf16cam_config_get()) ? 1U : 0U;
+		int setting = 0;
+		int valid = 0;
+
+		if (xf16cam_form_value(body, "light", mode, sizeof(mode)) == 0) {
+			setting = 1;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "intensity", mode, sizeof(mode)) == 0) {
+			setting = 2;
+			if (strcmp(mode, "stronger") == 0) {
+				stronger = 1;
+				valid = 1;
+			} else if (strcmp(mode, "weaker") == 0) {
+				stronger = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "daynight", mode, sizeof(mode)) == 0) {
+			setting = 3;
+			if (strcmp(mode, "enabled") == 0) {
+				daynight = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				daynight = 0;
+				valid = 1;
+			}
+		}
+		if (!valid) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid light setting.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting != 3 && XF16CAM_AUTO_DAY_NIGHT(xf16cam_config_get())) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Manual light controls are locked while automatic day/night is enabled.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if ((setting == 3 && xf16cam_config_save_daynight(daynight) != 0) ||
+		    (setting != 3 && xf16cam_config_save_light(enabled, stronger) != 0)) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save light settings to flash.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting == 3 && !daynight)
+			xf16cam_board_set_ir_led(0);
+		xf16cam_light_apply();
+		xf16cam_http_message(fd, "200 OK", "Light settings saved and applied. Return to the panel to view the current state.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/motion") == 0) {
+		uint8_t enabled = 0;
+		int setting = 0;
+		int valid = 0;
+
+		if (xf16cam_form_value(body, "motion", mode, sizeof(mode)) == 0) {
+			setting = 1;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "alarm", mode, sizeof(mode)) == 0) {
+			setting = 2;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		}
+		if (!valid) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid motion setting.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if ((setting == 1 && xf16cam_config_save_motion(enabled) != 0) ||
+		    (setting == 2 && xf16cam_config_save_motion_alarm(enabled) != 0)) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save motion settings to flash.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting == 1 && !enabled)
+			xf16cam_motion_reset();
+		xf16cam_http_message(fd, "200 OK", "Motion settings saved. Return to the panel to see updated status.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ptz") == 0) {
+		char action[12];
+		int direction = 0;
+
+		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0) {
+			xf16cam_http_message(fd, "400 Bad Request", "Missing PTZ direction.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (strcmp(mode, "left") == 0)
+			direction = XF16CAM_PTZ_LEFT;
+		else if (strcmp(mode, "right") == 0)
+			direction = XF16CAM_PTZ_RIGHT;
+		else if (strcmp(mode, "up") == 0)
+			direction = XF16CAM_PTZ_UP;
+		else if (strcmp(mode, "down") == 0)
+			direction = XF16CAM_PTZ_DOWN;
+		else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ direction.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+
+		if (xf16cam_form_value(body, "action", action, sizeof(action)) != 0 ||
+		    strcmp(action, "step") == 0) {
+			if (direction == XF16CAM_PTZ_LEFT)
+				ptz_move_left();
+			else if (direction == XF16CAM_PTZ_RIGHT)
+				ptz_move_right();
+			else if (direction == XF16CAM_PTZ_UP)
+				ptz_move_up();
+			else
+				ptz_move_down();
+		} else if (strcmp(action, "start") == 0) {
+			if (xf16cam_ptz_start(direction) != 0) {
+				xf16cam_http_message(fd, "503 Service Unavailable", "PTZ movement task unavailable.");
+				return XF16CAM_HTTP_KEEP_RUNNING;
+			}
+		} else if (strcmp(action, "stop") == 0) {
+			xf16cam_ptz_stop();
+		} else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ action.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "PTZ command accepted.");
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/media") == 0) {
-		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0 ||
-		    xf16cam_config_save_media(strcmp(mode, "web") == 0 ? XF16CAM_MEDIA_WEB :
-		                              strcmp(mode, "rtsp") == 0 ? XF16CAM_MEDIA_RTSP : 0) != 0) {
+		XF16CamMediaMode media_mode;
+
+		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0) {
 			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera mode.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		if (xf16cam_update_begin() != 0) {
+		if (strcmp(mode, "web") == 0)
+			media_mode = XF16CAM_MEDIA_WEB;
+		else if (strcmp(mode, "rtsp") == 0)
+			media_mode = XF16CAM_MEDIA_RTSP;
+		else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera mode.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_config_save_media_and_begin_update(media_mode) != 0) {
 			xf16cam_http_message(fd, "409 Conflict",
-			                     "Camera mode was saved, but reboot was deferred by another update.");
+			                     "Camera mode could not be saved or another operation is already in progress.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		xf16cam_http_message(fd, "200 OK", "Camera mode saved. Rebooting...");

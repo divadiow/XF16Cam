@@ -105,7 +105,7 @@ also cover a reproducible Linux build.
 
 | Control | XF16Cam function |
 | --- | --- |
-| PA15 mode button | Press and release to switch Browser MJPEG ↔ RTSP, save the choice, and reboot. |
+| PA15 mode button | Hold for at least 1.5 seconds, then release to switch Browser MJPEG ↔ RTSP, save the choice, and reboot. |
 | PA20 setup button | Hold for 3 seconds to restore the open `XF16CAM` setup AP and reboot. It is also configured as the hibernation wake input. |
 | PA21 status LED | Blinks while starting, stays on when services are ready, and turns off for hibernation. This is usually the blue LED on the tested A9. |
 | Red LED | Not controlled or characterised by XF16Cam; it may be part of the board's power/charging circuit. |
@@ -158,3 +158,6 @@ per-sensor resolution support.
 
 The teardown photographs above were made by `divadiow` during the original
 XF16 investigation. See the [image provenance notes](docs/images/README.md).
+
+
+Continuous capture uses a dedicated JPEG send-copy buffer when memory permits. This prevents the camera's rotating DMA buffers from being reused while a slow TCP client is still receiving a frame.
